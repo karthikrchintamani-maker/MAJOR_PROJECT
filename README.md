@@ -3,7 +3,7 @@
 [![ROS2 Humble](https://img.shields.io/badge/ROS2-Humble-blue.svg)](https://docs.ros.org/en/humble/)
 [![C++17](https://img.shields.io/badge/Language-C%2B%2B17-green.svg)](https://en.cppreference.com/w/cpp/17)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![SIH 2026](https://img.shields.io/badge/SIH-2026-orange.svg)](https://sih.gov.in/)
+[![MAJOR_PROJECT 2026](https://img.shields.io/badge/SIH-2026-orange.svg)](https://sih.gov.in/)
 
 RoadEye is a modular, high-performance **Level-3 ADAS research prototype** engineered specifically for the chaotic, dynamic, and unstructured driving conditions of Indian roads. 
 
