@@ -1,0 +1,7 @@
+# RoadEye Dashboard Configuration
+dashboard:
+  port: 3000
+  websocket_port: 9090
+  update_frequency_hz: 10
+  map_provider: "OpenStreetMap"
+  emergency_phone_number: "+919876543210"

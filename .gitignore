@@ -1,0 +1,52 @@
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+
+# ROS2 generated files
+**/build/
+**/install/
+**/log/
+
+# Logs
+backend/logs/
+
+# Uploaded videos
+backend/uploads/
+
+# Generated output videos
+backend/output_test_video/
+backend/static/outputs/
+
+# Large AI model files
+backend/models/
+
+# Git
+.git/
+
+# Generated frontend build
+frontend/dist/
+
+# Uploaded/generated videos
+backend/static/uploads/
+backend/uploads/
+backend/output_test_video/
+backend/static/outputs/
+
+# Generated backend output
+backend/output/
+
+# Large datasets
+backend/vehicle_data/
+
+# Generated test media
+backend/test_road.jpg
+frontend/public/*.mp4
+frontend/public/*.avi

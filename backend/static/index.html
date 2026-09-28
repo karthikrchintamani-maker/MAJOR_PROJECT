@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RoadEye — Vehicle Telemetry & Perception Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Chart.js and FontAwesome CDNs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- TOP NAVIGATION BAR -->
+        <header class="app-header">
+            <div class="logo">
+                <i class="fa-solid fa-eye eye-glow"></i>
+                <span class="brand-text">RoadEye <span class="sub-text">AI Telemetry Cockpit</span></span>
+            </div>
+            <div class="header-status">
+                <span class="status-indicator online"></span>
+                <span class="status-text">SYSTEM ACTIVE</span>
+            </div>
+        </header>
+
+        <div class="dashboard-grid">
+            <!-- LEFT CONTROL PANEL -->
+            <aside class="control-panel panel-glow">
+                <h3><i class="fa-solid fa-sliders"></i> Configuration</h3>
+                
+                <div class="config-section">
+                    <label for="segment-select">Telemetry Segment</label>
+                    <select id="segment-select" class="form-control">
+                        <option value="">Loading segments...</option>
+                    </select>
+                </div>
+
+                <div class="config-section">
+                    <label for="conf-slider">Confidence Threshold: <span id="conf-val">0.25</span></label>
+                    <input type="range" id="conf-slider" min="0.10" max="0.90" step="0.05" value="0.25" class="slider">
+                </div>
+
+                <div class="config-section divider"></div>
+
+                <h3><i class="fa-solid fa-file-import"></i> Media Feed</h3>
+                <div class="upload-container" id="drop-zone">
+                    <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
+                    <p>Drag & Drop file or click to browse</p>
+                    <span class="file-spec">Supports images/videos</span>
+                    <input type="file" id="file-input" accept="image/*,video/*" hidden>
+                </div>
+                <div id="file-info" class="file-info-box hidden">
+                    <span id="filename-display">No file selected</span>
+                    <button id="clear-file-btn" class="btn-clear"><i class="fa-solid fa-times"></i></button>
+                </div>
+
+                <div class="action-buttons">
+                    <button id="run-btn" class="btn btn-primary"><i class="fa-solid fa-play"></i> Run Pipeline</button>
+                    <button id="dummy-btn" class="btn btn-secondary"><i class="fa-solid fa-wand-magic-sparkles"></i> Test Dummy Scene</button>
+                </div>
+
+                <div class="telemetry-info-box">
+                    <h4>Current Frame Telemetry</h4>
+                    <div class="info-row">
+                        <span class="info-label">Timestamp:</span>
+                        <span class="info-val" id="hud-time">-- : -- : --</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Segment:</span>
+                        <span class="info-val" id="hud-seg">--</span>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- MIDDLE MAIN MEDIA DISPLAY -->
+            <main class="media-display panel-glow">
+                <div class="media-header">
+                    <h3><i class="fa-solid fa-camera"></i> Perception Stream <span class="badge">Combined overlays + Depth Map</span></h3>
+                </div>
+                <div class="media-wrapper">
+                    <!-- Default Placeholder -->
+                    <div id="media-placeholder" class="media-placeholder">
+                        <i class="fa-solid fa-video-slash"></i>
+                        <p>Upload a video/image or click "Test Dummy Scene" to view inference stream</p>
+                    </div>
+                    <!-- Output Images/Videos -->
+                    <img id="output-image" class="output-media hidden" alt="RoadEye Output Stream">
+                    <video id="output-video" class="output-media hidden" controls autoplay loop></video>
+                    
+                    <!-- Floating Processing Overlay -->
+                    <div id="loading-overlay" class="loading-overlay hidden">
+                        <div class="spinner"></div>
+                        <p>Processing frame through RoadEye models...</p>
+                    </div>
+                </div>
+            </main>
+
+            <!-- RIGHT GAUGES PANEL -->
+            <section class="gauges-panel panel-glow">
+                <h3><i class="fa-solid fa-gauge-high"></i> Instruments</h3>
+                
+                <div class="gauges-container">
+                    <!-- SPEEDOMETER -->
+                    <div class="gauge-card">
+                        <span class="gauge-title">SPEED</span>
+                        <div class="gauge-body">
+                            <div class="gauge-dial speed-dial">
+                                <div class="gauge-bar" id="speed-bar"></div>
+                                <div class="gauge-value" id="speed-val">0.0</div>
+                                <div class="gauge-unit">km/h</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- TACHOMETER (RPM) -->
+                    <div class="gauge-card">
+                        <span class="gauge-title">TACHOMETER</span>
+                        <div class="gauge-body">
+                            <div class="gauge-dial rpm-dial">
+                                <div class="gauge-bar" id="rpm-bar"></div>
+                                <div class="gauge-value" id="rpm-val">0</div>
+                                <div class="gauge-unit">RPM</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- AUX telemetry grid -->
+                <div class="aux-grid">
+                    <div class="aux-item">
+                        <span class="aux-label">GEAR</span>
+                        <span class="aux-value highlight-cyan" id="gear-val">N</span>
+                    </div>
+                    <div class="aux-item">
+                        <span class="aux-label">THROTTLE</span>
+                        <span class="aux-value highlight-green" id="throttle-val">0%</span>
+                    </div>
+                    <div class="aux-item">
+                        <span class="aux-label">ENG LOAD</span>
+                        <span class="aux-value" id="load-val">0%</span>
+                    </div>
+                    <div class="aux-item">
+                        <span class="aux-label">FUEL FLOW</span>
+                        <span class="aux-value" id="fuel-val">0.0 ml/m</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- BOTTOM TIMELINE GRAPH -->
+            <footer class="graph-panel panel-glow">
+                <div class="graph-header">
+                    <h3><i class="fa-solid fa-chart-line"></i> OBD2 Sensor Sync Timeline</h3>
+                    <span class="instruction-text"><i class="fa-solid fa-circle-info"></i> Click any point on the graph to view the perception overlays matching that moment</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="telemetry-chart"></canvas>
+                </div>
+            </footer>
+        </div>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

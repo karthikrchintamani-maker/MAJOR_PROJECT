@@ -1,0 +1,14 @@
+# RoadEye Vehicle Geometry & ADAS Thresholds Configuration
+vehicle:
+  length_m: 4.2
+  width_m: 1.8
+  height_m: 1.5
+  wheelbase_m: 2.6
+  max_deceleration_ms2: 8.5
+
+adas_thresholds:
+  fcw_ttc_sec: 2.5
+  aeb_recommendation_ttc_sec: 1.2
+  ldw_center_offset_m: 0.55
+  drowsiness_eye_ratio: 0.40
+  speed_limit_kmh: 80.0

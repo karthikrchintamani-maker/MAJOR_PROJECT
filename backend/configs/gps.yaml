@@ -1,0 +1,9 @@
+# RoadEye GPS Configuration
+gps:
+  baud_rate: 9600
+  update_rate_hz: 5
+  min_satellites: 4
+  reference_point:
+    lat: 28.6139
+    lon: 77.2090
+    alt: 216.0

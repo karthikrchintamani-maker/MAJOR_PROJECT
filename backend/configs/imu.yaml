@@ -1,0 +1,8 @@
+# RoadEye MPU6050 IMU Configuration
+imu:
+  i2c_bus: 1
+  i2c_address: 0x68
+  sample_rate_hz: 100
+  crash_g_threshold: 4.0
+  gyro_scale_dps: 250
+  accel_scale_g: 8

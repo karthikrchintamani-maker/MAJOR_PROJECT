@@ -1,0 +1,25 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Topic: /roadeye/sensor/lidar
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Detections
+      Topic: /roadeye/perception/objects
+      Value: true
+  Global Options:
+    Fixed Frame: base_link
+    Frame Rate: 30

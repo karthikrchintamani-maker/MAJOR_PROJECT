@@ -1,0 +1,36 @@
+name: RoadEye Production CI
+
+on:
+  push:
+    branches: [ main, master, dev ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup ROS2 Humble Environment
+        uses: ros-tooling/setup-ros@v0.6
+        with:
+          required-ros-distributions: humble
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libyaml-cpp-dev libopencv-dev
+
+      - name: Build ROS2 Workspace
+        run: |
+          source /opt/ros/humble/setup.bash
+          cd ros2_ws
+          colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: Run C++ Unit Tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          cd ros2_ws
+          colcon test
+          colcon test-result --all

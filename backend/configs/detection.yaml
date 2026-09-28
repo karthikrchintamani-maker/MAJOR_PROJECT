@@ -1,0 +1,36 @@
+# RoadEye AI Detection Configuration
+models:
+  object_detection:
+    onnx_path: "models/detection/yolo26n_indian_road_best.onnx"
+    pt_path: "models/detection/yolo26n_indian_road_best.pt"
+    confidence_threshold: 0.40
+    nms_iou_threshold: 0.45
+    input_size: [640, 640]
+
+  road_segmentation:
+    onnx_path: "models/segmentation/yolo11m-road-seg.onnx"
+    pt_path: "models/segmentation/yolo11m-road-seg.pt"
+    confidence_threshold: 0.35
+    input_size: [640, 640]
+
+  pothole_detection:
+    onnx_path: "models/pothole/pothole-detection-yolov8.onnx"
+    pt_path: "models/pothole/pothole-detection-yolov8.pt"
+    confidence_threshold: 0.35
+    input_size: [640, 640]
+
+  depth_estimation:
+    onnx_path: "models/depth/unet_depthwise_nano_best.onnx"
+    pt_path: "models/depth/unet_depthwise_nano_best.pt"
+    input_size: [256, 256]
+
+class_names:
+  - "car"
+  - "truck"
+  - "bus"
+  - "motorcycle"
+  - "auto_rickshaw"
+  - "pedestrian"
+  - "bicycle"
+  - "animal"
+  - "traffic_sign"
