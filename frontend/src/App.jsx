@@ -64,8 +64,8 @@ export default function App() {
     rpm: 1750,
     lidarDistM: 6.4,
     riskScore: 28.5,
-    lat: 28.6139,
-    lng: 77.2090,
+    lat: 13.05005,
+    lng: 77.71700,
     coolantTemp: 82,
     batteryVolt: 13.8,
     fps: 0,
@@ -257,6 +257,36 @@ export default function App() {
     }
   }, [activeScenario, backendOnline]);
 
+  // Live GPS tracking via browser geolocation (with East Point College Bangalore fallback)
+  useEffect(() => {
+    if ('geolocation' in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          setTelemetry(prev => ({
+            ...prev,
+            lat: +latitude.toFixed(5),
+            lng: +longitude.toFixed(5),
+          }));
+          pushLog(`[GPS] NEO-6M synchronized with local coordinates: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        },
+        (err) => {
+          console.info('Using East Point College Bengaluru GPS coordinates (13.05005, 77.71700):', err.message);
+        },
+        { enableHighAccuracy: true, timeout: 6000 }
+      );
+    }
+  }, [pushLog]);
+
+  const handleUpdateLocation = useCallback((newLat, newLng) => {
+    setTelemetry(prev => ({
+      ...prev,
+      lat: +newLat.toFixed(5),
+      lng: +newLng.toFixed(5),
+    }));
+    pushLog(`[GPS] Location updated: ${newLat.toFixed(5)}, ${newLng.toFixed(5)} (East Point Campus, Avalahalli)`);
+  }, [pushLog]);
+
   // Simulation oscillation loop (offline only)
   useEffect(() => {
     if (backendOnline) return;
@@ -264,14 +294,17 @@ export default function App() {
       if (activeScenario === 'emergency') return;
       setTelemetry(prev => {
         const t = Date.now() / 1000;
+        // Anchor to East Point College Campus (13.05005, 77.71700) or user's detected local location
+        const baseLat = (prev.lat && Math.abs(prev.lat - 13.05005) < 0.1) ? prev.lat : 13.05005;
+        const baseLng = (prev.lng && Math.abs(prev.lng - 77.71700) < 0.1) ? prev.lng : 77.71700;
         return {
           ...prev,
           speedKmh:   +(prev.speedKmh  + Math.sin(t) * 0.3).toFixed(1),
           rpm:        Math.round(prev.rpm + Math.sin(t) * 15),
           lidarDistM: +(prev.lidarDistM + Math.sin(t * 1.5) * 0.12).toFixed(1),
           riskScore:  Math.min(100, Math.max(0, +(prev.riskScore + Math.sin(t * 0.8) * 0.8).toFixed(1))),
-          lat: +(28.6139 + Math.sin(t / 60) * 0.0015).toFixed(5),
-          lng: +(77.2090 + Math.cos(t / 60) * 0.0015).toFixed(5),
+          lat: +(baseLat + Math.sin(t / 60) * 0.0003).toFixed(5),
+          lng: +(baseLng + Math.cos(t / 60) * 0.0003).toFixed(5),
         };
       });
     }, 100);
@@ -443,7 +476,7 @@ export default function App() {
             </div>
 
             <div className="flex-1 min-h-0 grid grid-cols-12 gap-3">
-              <div className="col-span-6 h-full min-h-0"><GpsMap lat={telemetry.lat} lng={telemetry.lng} activeScenario={activeScenario} /></div>
+              <div className="col-span-6 h-full min-h-0"><GpsMap lat={telemetry.lat} lng={telemetry.lng} activeScenario={activeScenario} onUpdateLocation={handleUpdateLocation} /></div>
               <div className="col-span-6 glass-panel p-3 rounded-2xl border border-borderblue bg-cardbg flex flex-col gap-1.5 shadow-lg h-full min-h-0">
                 <div className="flex items-center justify-between border-b border-borderblue pb-1.5">
                   <div className="flex items-center gap-1.5 text-xs font-bold text-slate-100">
@@ -646,7 +679,7 @@ export default function App() {
         {['Sensor Hub', 'System Health'].includes(activeTab) && (
           <div className="flex-1 min-h-0 grid grid-cols-12 gap-3">
             <div className="col-span-4 h-full"><SensorHealth health={sensorHealth} /></div>
-            <div className="col-span-8 h-full"><GpsMap lat={telemetry.lat} lng={telemetry.lng} activeScenario={activeScenario} /></div>
+            <div className="col-span-8 h-full"><GpsMap lat={telemetry.lat} lng={telemetry.lng} activeScenario={activeScenario} onUpdateLocation={handleUpdateLocation} /></div>
           </div>
         )}
 

@@ -170,8 +170,8 @@ void SensorBridgeNode::publishSimulatedData() {
   telem.engine_rpm = 2200.0f + 200.0f * std::sin(t * 0.5f);
   telem.coolant_temp_c = 88.0f;
   telem.battery_voltage = 13.8f;
-  telem.latitude = 28.6139 + 0.0001 * std::sin(t * 0.01f); // New Delhi test track
-  telem.longitude = 77.2090 + 0.0001 * std::cos(t * 0.01f);
+  telem.latitude = 13.05005 + 0.0001 * std::sin(t * 0.01f); // East Point Campus, Avalahalli
+  telem.longitude = 77.71700 + 0.0001 * std::cos(t * 0.01f);
   telem.gps_valid = true;
   telem.gps_satellites = 12;
   telem.linear_acceleration.x = 0.1f * std::cos(t);

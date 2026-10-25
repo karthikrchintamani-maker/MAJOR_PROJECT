@@ -14,6 +14,8 @@ import numpy as np
 
 from config import (
     CONF_THRESH, NMS_THRESH, INPUT_SIZE,
+    POTHOLE_CONF_THRESH, POTHOLE_NMS_THRESH,
+    POTHOLE_TARGET_CLASSES, POTHOLE_DEBUG_LOGGING,
     DETECTION_CLASSES, POTHOLE_CLASSES,
 )
 from models_loader import (
@@ -99,45 +101,51 @@ class RoadEyePipeline:
         out    = frame_bgr.copy()
 
         # 1. Object detection
-        det_m = self.models.get("detection")
-        if det_m and det_m.backend != "simulation":
-            result.detections = self._run_detection(frame_bgr, det_m, (h, w))
-        elif show_boxes:
-            result.detections = self._sim_detection(frame_bgr, (h, w))
+        if show_boxes:
+            det_m = self.models.get("detection")
+            if det_m and det_m.backend != "simulation":
+                result.detections = self._run_detection(frame_bgr, det_m, (h, w))
+            else:
+                result.detections = self._sim_detection(frame_bgr, (h, w))
 
         # 2. Pothole detection
-        pot_m = self.models.get("pothole")
-        if pot_m and pot_m.backend != "simulation":
-            result.potholes = self._run_pothole(frame_bgr, pot_m, (h, w))
-        elif show_boxes:
-            result.potholes = self._sim_pothole(frame_bgr, (h, w))
+        if show_boxes:
+            pot_m = self.models.get("pothole")
+            obstacles = [d.box for d in result.detections]
+            if pot_m and pot_m.backend != "simulation":
+                result.potholes = self._run_pothole(frame_bgr, pot_m, (h, w), obstacles=obstacles)
+            else:
+                result.potholes = self._sim_pothole(frame_bgr, (h, w))
 
         # 3. Road segmentation
-        seg_m = self.models.get("segmentation")
-        if seg_m and seg_m.backend != "simulation":
-            result.seg_mask = self._run_segmentation(frame_bgr, seg_m, (h, w))
-        elif show_seg:
-            result.seg_mask = self._sim_segmentation(frame_bgr, (h, w))
+        if show_seg:
+            seg_m = self.models.get("segmentation")
+            if seg_m and seg_m.backend != "simulation":
+                result.seg_mask = self._run_segmentation(frame_bgr, seg_m, (h, w))
+            else:
+                result.seg_mask = self._sim_segmentation(frame_bgr, (h, w))
 
         # 4. Depth
-        dep_m = self.models.get("depth")
-        if dep_m and dep_m.backend != "simulation":
-            result.depth_map = self._run_depth(frame_bgr, dep_m, (h, w))
-        elif show_depth:
-            result.depth_map = self._sim_depth(frame_bgr, (h, w))
+        if show_depth:
+            dep_m = self.models.get("depth")
+            if dep_m and dep_m.backend != "simulation":
+                result.depth_map = self._run_depth(frame_bgr, dep_m, (h, w))
+            else:
+                result.depth_map = self._sim_depth(frame_bgr, (h, w))
 
         # Analytics
         result.risk_score     = self._risk(result, (h, w))
         result.closest_dist_m = self._closest(result, (h, w))
         result.warnings       = self._warnings(result)
 
+        result.fps = self._tick()
+        modes = list({m.backend for m in self.models.values()})
+        result.mode = modes[0] if len(modes) == 1 else "mixed"
+
         # Draw
         self._draw(out, result, show_boxes, show_seg, show_depth, show_lanes)
         self._osd(out, result, (h, w))
 
-        result.fps = self._tick()
-        modes = list({m.backend for m in self.models.values()})
-        result.mode = modes[0] if len(modes) == 1 else "mixed"
         return out, result
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -145,24 +153,142 @@ class RoadEyePipeline:
     # ══════════════════════════════════════════════════════════════════════════
     def _run_detection(self, frame, model, orig_hw):
         try:
-            tensor = preprocess_frame(frame, INPUT_SIZE)
+            tensor, lb_meta = preprocess_frame(frame, INPUT_SIZE, normalize=True, use_letterbox=True)
             outs   = model.session.run(model.output_names, {model.input_name: tensor})
-            raw    = decode_yolo_detect_output(outs[0], orig_hw, CONF_THRESH, NMS_THRESH)
+            raw    = decode_yolo_detect_output(outs[0], orig_hw, conf_thresh=CONF_THRESH, iou_thresh=NMS_THRESH, letterbox_meta=lb_meta)
             return [Detection(d["box"], d["conf"], d["cls"],
                               DETECTION_CLASSES.get(d["cls"], f"cls{d['cls']}")) for d in raw]
         except Exception as e:
             log.error("Detection error: %s", e)
             return self._sim_detection(frame, orig_hw)
 
-    def _run_pothole(self, frame, model, orig_hw):
+    def _run_pothole(self, frame, model, orig_hw, obstacles=None):
+        """
+        Runs YOLOv8 pothole detection model across the entire frame.
+        - Uses RGB float32 tensor normalized to [0, 1] with letterbox padding.
+        - Unscales bounding boxes with exact aspect ratio preservation.
+        - Filters to target defect classes (Class 3: Pothole, Class 4: Other road surface distress).
+        - Suppresses false positives by checking:
+            1. Road perspective geometry: ground-plane potholes foreshorten horizontally (AR >= 1.0).
+            2. Scale constraints: single pothole cannot exceed 22% of frame height.
+            3. Sky/horizon exclusion (potholes cannot be in upper 15% of frame).
+            4. Hood exclusion (potholes cannot be on vehicle dashboard/hood > 94% of frame height).
+            5. Heavy vegetation/grass regions (checks green HSV content).
+            6. Obstacle & vehicle shadow suppression: strictly suppresses candidates that overlap
+               with detected vehicles, tires, or fall into shadow strips trailing immediately behind them.
+        - Employs container suppression to keep smaller specific potholes over large enveloping boxes.
+        - Applies class-aware NMS to eliminate duplicate detections of the same pothole.
+        """
+        oh, ow = orig_hw
+        onnx_dets: list[Detection] = []
         try:
-            tensor = preprocess_frame(frame, INPUT_SIZE)
-            outs   = model.session.run(model.output_names, {model.input_name: tensor})
-            raw    = decode_yolo_detect_output(outs[0], orig_hw, CONF_THRESH, NMS_THRESH)
-            return [Detection(d["box"], d["conf"], d["cls"], "Pothole") for d in raw]
+            tensor, lb_meta = preprocess_frame(frame, INPUT_SIZE, normalize=True, use_letterbox=True)
+            outs = model.session.run(model.output_names, {model.input_name: tensor})
+            raw = decode_yolo_detect_output(
+                outs[0], orig_hw,
+                conf_thresh=POTHOLE_CONF_THRESH,
+                iou_thresh=POTHOLE_NMS_THRESH,
+                letterbox_meta=lb_meta,
+                target_classes=POTHOLE_TARGET_CLASSES
+            )
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            green_grass = (hsv[:, :, 0] >= 32) & (hsv[:, :, 0] <= 85) & (hsv[:, :, 1] >= 45)
+
+            rejected_obstacles = 0
+            rejected_geom = 0
+
+            for d in raw:
+                bx = d["box"]
+                bw = bx[2] - bx[0]
+                bh = bx[3] - bx[1]
+                p_area = bw * bh
+
+                # Area & dimension sanity checks
+                if bh < 8 or bw < 14 or p_area < 120:
+                    rejected_geom += 1
+                    continue
+                if bw > ow * 0.70 or bh > oh * 0.22:
+                    rejected_geom += 1
+                    continue
+                # Road perspective foreshortening constraint:
+                # Due to dashcam pitch angle, any flat surface defect on the road plane has AR >= 1.0 (W >= H).
+                # Vertical boxes (AR < 1.0) are vertical objects (vehicles, poles, lane strips).
+                ar = bw / max(bh, 1)
+                if ar < 1.0 or ar > 5.5:
+                    rejected_geom += 1
+                    continue
+
+                # Road boundary sanity
+                if bx[3] < oh * 0.15:  # Sky / horizon
+                    rejected_geom += 1
+                    continue
+                if bx[1] > oh * 0.94:  # Dashboard / vehicle hood
+                    rejected_geom += 1
+                    continue
+
+                # Filter roadside vegetation
+                roi_g = green_grass[max(0, bx[1]):min(oh, bx[3]), max(0, bx[0]):min(ow, bx[2])]
+                if roi_g.size > 0 and roi_g.mean() > 0.35:
+                    rejected_geom += 1
+                    continue
+
+                # Obstacle & shadow exclusion
+                if obstacles:
+                    cx = (bx[0] + bx[2]) / 2.0
+                    cy = (bx[1] + bx[3]) / 2.0
+                    is_on_obstacle = False
+                    for ob in obstacles:
+                        ox1, oy1, ox2, oy2 = ob
+                        ob_w = ox2 - ox1
+                        ob_h = oy2 - oy1
+                        ob_area = max(1, ob_w * ob_h)
+
+                        # 1. Pothole center inside obstacle
+                        if ox1 <= cx <= ox2 and oy1 <= cy <= oy2:
+                            is_on_obstacle = True
+                            break
+
+                        # 2. Overlap with obstacle (e.g. wheels/tires/bumper)
+                        ix1 = max(bx[0], ox1); iy1 = max(bx[1], oy1)
+                        ix2 = min(bx[2], ox2); iy2 = min(bx[3], oy2)
+                        if ix2 > ix1 and iy2 > iy1:
+                            inter = (ix2 - ix1) * (iy2 - iy1)
+                            if (inter / p_area > 0.15) or (inter / ob_area > 0.15):
+                                is_on_obstacle = True
+                                break
+
+                        # 3. Vehicle shadow trailing immediately below vehicle bottom
+                        h_inter = max(0, min(bx[2], ox2) - max(bx[0], ox1))
+                        if h_inter / max(bw, 1) > 0.45:
+                            if oy1 <= bx[1] <= oy2 + ob_h * 0.25:
+                                is_on_obstacle = True
+                                break
+
+                    if is_on_obstacle:
+                        rejected_obstacles += 1
+                        continue
+
+                clamped_box = [max(0, bx[0]), max(0, bx[1]), min(ow - 1, bx[2]), min(oh - 1, bx[3])]
+                onnx_dets.append(Detection(
+                    box=clamped_box,
+                    conf=round(float(d["conf"]), 2),
+                    cls=d["cls"],
+                    label="Pothole"
+                ))
+
+            if POTHOLE_DEBUG_LOGGING:
+                log.info(
+                    f"[DEBUG Pothole] Raw decoded: {len(raw)}, Valid: {len(onnx_dets)}, "
+                    f"Rejected (Obstacle: {rejected_obstacles}, Geom/Sky/Veg: {rejected_geom})"
+                )
         except Exception as e:
-            log.error("Pothole error: %s", e)
-            return []
+            log.error("Pothole model error: %s", e)
+            return self._sim_pothole(frame, orig_hw)
+
+        # Sort top-to-bottom, left-to-right (scanning order)
+        onnx_dets.sort(key=lambda d: (d.box[1], d.box[0]))
+        return onnx_dets
 
     def _run_segmentation(self, frame, model, orig_hw):
         try:
@@ -351,99 +477,130 @@ class RoadEyePipeline:
 
         return results
 
-    # ── Pothole Detection Simulation ──────────────────────────────────────────
+    # ── Pothole Detection Multi-Scale Scanner ─────────────────────────────────
     def _sim_pothole(self, frame: np.ndarray, orig_hw: tuple) -> list[Detection]:
         """
-        Detect road surface anomalies:
-        - Restrict to the confirmed road surface (lower trapezoid, masked by road colour)
-        - Find dark patches (potholes/cracks are darker than surrounding road)
-        - Find rough-texture patches (cracks produce high Laplacian response)
-        - Apply strict size + shape filters to avoid false positives on lane markings
+        Detects ALL visible road surface anomalies and potholes across the entire frame:
+        - Scans full width from left to right (x: 0 to w), including edges and corners.
+        - Scans top to bottom from horizon (~22% of height) to foreground (98% of height).
+        - Multi-scale detection:
+            * Scale A (21x21 kernel) for dark road crevices, fractures, and potholes.
+            * Scale B (41x41 kernel + low saturation) for water-filled potholes & reflective puddles.
+        - Excludes vegetation/grass roadside fields via HSV masking.
+        - Minimizes morphological dilation/closing so separate potholes stay distinct.
+        - Suppresses giant container boxes in favor of individual separate potholes.
+        - Applies Non-Maximum Suppression (NMS) to eliminate duplicate boxes while
+          maintaining individual boxes for separate nearby potholes.
+        - Marks EVERY detected pothole separately with 'Pothole' label and confidence score.
         """
         h, w = orig_hw
-        road_mask = self._road_mask(frame)
-
-        # Only look at road surface, bottom 50% of frame
-        search_mask = np.zeros((h, w), dtype=np.uint8)
-        search_mask[int(h * 0.50):, :] = 255
-        search_mask = cv2.bitwise_and(search_mask, road_mask)
-
-        if search_mask.sum() < 1000:   # road surface too small → skip
-            return []
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # ── Dark-patch detector (potholes are usually darker than road) ──────
-        # Compute local mean using a large kernel
-        blur = cv2.GaussianBlur(gray, (31, 31), 0)
-        dark_diff = blur.astype(np.int16) - gray.astype(np.int16)
-        dark_diff = np.clip(dark_diff, 0, 255).astype(np.uint8)
-        _, dark_thresh = cv2.threshold(dark_diff, 25, 255, cv2.THRESH_BINARY)
-        dark_thresh = cv2.bitwise_and(dark_thresh, search_mask)
-
-        # ── Texture / crack detector ──────────────────────────────────────────
-        lap  = cv2.Laplacian(gray, cv2.CV_16S, ksize=5)
-        lap_u = cv2.convertScaleAbs(lap)
-        _, tex_thresh = cv2.threshold(lap_u, 40, 255, cv2.THRESH_BINARY)
-        tex_thresh = cv2.bitwise_and(tex_thresh, search_mask)
-
-        # Combine: dark patches that also have high texture
-        combined = cv2.bitwise_and(dark_thresh, tex_thresh)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,
-                                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-
-        results: list[Detection] = []
         img_area = h * w
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # 1. Vegetation mask: roadside grass and fields (Hue: 32..85, Sat >= 45)
+        green_grass = (hsv[:, :, 0] >= 32) & (hsv[:, :, 0] <= 85) & (hsv[:, :, 1] >= 45)
+
+        # 2. Road search vertical span: from horizon down to bonnet/foreground
+        search_mask = np.zeros((h, w), dtype=np.uint8)
+        search_mask[int(h * 0.22):int(h * 0.98), :] = 255
+        search_mask[green_grass] = 0
+
+        # 3. Multi-scale anomaly extraction:
+        # Scale A: Dark road crevices, fractures, and deep potholes (21x21 kernel)
+        b21 = cv2.GaussianBlur(gray, (21, 21), 0)
+        d21 = np.clip(b21.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
+        _, t_dark = cv2.threshold(d21, 18, 255, cv2.THRESH_BINARY)
+        t_dark = cv2.bitwise_and(t_dark, search_mask)
+
+        # Scale B: Water-filled potholes & reflective puddles (41x41 kernel, low sat)
+        b41 = cv2.GaussianBlur(gray, (41, 41), 0)
+        br_diff = np.clip(gray.astype(np.int16) - b41.astype(np.int16), 0, 255).astype(np.uint8)
+        _, t_puddle = cv2.threshold(br_diff, 18, 255, cv2.THRESH_BINARY)
+        low_sat = (hsv[:, :, 1] < 80).astype(np.uint8) * 255
+        t_puddle = cv2.bitwise_and(t_puddle, low_sat)
+        t_puddle = cv2.bitwise_and(t_puddle, search_mask)
+
+        # Combine candidate anomalies across full width and height
+        anomalies = cv2.bitwise_or(t_dark, t_puddle)
+
+        # Separation: small morphological closing ensures neighboring potholes stay distinct
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        anom_sep = cv2.morphologyEx(anomalies, cv2.MORPH_CLOSE, k_close)
+        anom_sep = cv2.morphologyEx(anom_sep, cv2.MORPH_OPEN, k_open)
+
+        contours, _ = cv2.findContours(anom_sep, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         raw_boxes = []
 
-        for c in sorted(contours, key=cv2.contourArea, reverse=True):
+        for c in contours:
             area = cv2.contourArea(c)
-            # Pothole size: between 0.15% and 8% of frame
-            if area < img_area * 0.0015 or area > img_area * 0.08:
+            # Area gates: from 0.03% (small distant pothole) to 5.0% of frame (large foreground pothole)
+            if area < img_area * 0.0003 or area > img_area * 0.05:
                 continue
             x, y, bw, bh = cv2.boundingRect(c)
-            # Must be reasonably compact (not a long thin line = lane marking)
+            if bw < 16 or bh < 10:
+                continue
             ar = bw / max(bh, 1)
-            if ar > 5.0 or ar < 0.2:
+            # Filter out extreme thin streaks (lane lines or roadside edges)
+            if ar > 3.6 or ar < 0.28:
                 continue
-            # Min physical size in pixels
-            if bw < 15 or bh < 10:
-                continue
-            # Solidity check: pothole fills most of its bounding box
-            hull_area = cv2.contourArea(cv2.convexHull(c))
-            solidity = area / max(hull_area, 1)
-            if solidity < 0.35:
-                continue
-            # Must be mostly on road mask
-            roi_road = road_mask[y:y+bh, x:x+bw]
-            road_fill = roi_road.mean() / 255.0
-            if road_fill < 0.30:
+            # Avoid single box spanning the whole road
+            if bw > w * 0.32:
                 continue
 
-            score = min(0.92, 0.55 + road_fill * 0.35 + solidity * 0.10)
-            raw_boxes.append((x, y, x+bw, y+bh, score))
+            roi_grass = green_grass[y:y+bh, x:x+bw]
+            if roi_grass.mean() > 0.25:
+                continue
 
-        # NMS on pothole candidates
-        if raw_boxes:
-            boxes_np  = np.array([[b[0],b[1],b[2],b[3]] for b in raw_boxes], dtype=float)
-            scores_np = np.array([b[4] for b in raw_boxes])
-            keep_ids  = _nms(boxes_np, scores_np, iou_thresh=0.30)
-            raw_boxes = [raw_boxes[i] for i in keep_ids]
+            roi_gray = gray[y:y+bh, x:x+bw]
+            contrast = float(roi_gray.std())
+            conf = min(0.88, max(0.48, 0.44 + (contrast / 55.0) * 0.28 + min(0.16, area / (img_area * 0.015))))
+            raw_boxes.append((x, y, x + bw, y + bh, conf))
 
-        for (x1, y1, x2, y2, score) in raw_boxes[:3]:   # max 3 potholes
-            cls_id = 3   # Pothole
+        if not raw_boxes:
+            return []
+
+        # Nested container suppression: Keep smaller distinct potholes over giant enclosing boxes
+        filtered = []
+        for i, b1 in enumerate(raw_boxes):
+            suppress = False
+            area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+            for j, b2 in enumerate(raw_boxes):
+                if i == j:
+                    continue
+                area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+                ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+                ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+                if ix2 > ix1 and iy2 > iy1:
+                    inter = (ix2 - ix1) * (iy2 - iy1)
+                    if inter / area2 > 0.70 and area1 > 1.8 * area2:
+                        suppress = True
+                        break
+                    elif inter / min(area1, area2) > 0.60:
+                        if b1[4] < b2[4]:
+                            suppress = True
+                            break
+            if not suppress:
+                filtered.append(b1)
+
+        # Non-Maximum Suppression to prevent multiple boxes on the same pothole
+        boxes_np  = np.array([[b[0], b[1], b[2], b[3]] for b in filtered], dtype=float)
+        scores_np = np.array([b[4] for b in filtered])
+        keep_ids  = _nms(boxes_np, scores_np, iou_thresh=POTHOLE_NMS_THRESH)
+
+        results: list[Detection] = []
+        for i in keep_ids:
+            b = filtered[i]
             results.append(Detection(
-                box=[x1, y1, x2, y2],
-                conf=round(score, 2),
-                cls=cls_id,
+                box=[b[0], b[1], b[2], b[3]],
+                conf=round(float(b[4]), 2),
+                cls=3,
                 label="Pothole"
             ))
 
+        # Sort top-to-bottom, left-to-right (scanning order)
+        results.sort(key=lambda d: (d.box[1], d.box[0]))
         return results
 
     # ── Road Segmentation Simulation ──────────────────────────────────────────
@@ -569,7 +726,7 @@ class RoadEyePipeline:
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
 
         # Label chip
-        txt = f"{label}  {conf:.2f}"
+        txt = f"{label} {conf:.2f}"
         font_scale = 0.50
         font_thick = 1
         (tw, th), baseline = cv2.getTextSize(

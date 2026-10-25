@@ -12,6 +12,7 @@ import sys
 import os
 
 # Disable OpenCV multithreading and set FFmpeg threading limits to prevent libavcodec crashes
+os.environ["OPENCV_FFMPEG_THREADS"] = "1"
 os.environ["OPENCV_FFMPEG_THREAD_ONCE"] = "1"
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "threads|1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -86,6 +87,7 @@ _pipeline: RoadEyePipeline | None = None
 
 _capture_lock = threading.Lock()
 _capture: cv2.VideoCapture | None = None
+_capture_thread: threading.Thread | None = None
 _source_type: str = "none"       # "webcam" | "espcam" | "upload"
 _source_path: str = ""           # file path or URL
 
@@ -94,6 +96,24 @@ _latest_frame: np.ndarray | None = None
 _latest_result: InferenceResult | None = None
 _latest_jpeg: bytes | None = None
 _frame_lock = threading.Lock()
+
+
+def _stop_capture_thread():
+    """Safely and deterministically stop any active capture thread and release hardware."""
+    global _capture_thread, _capture, _source_type
+    _running.clear()
+    if _capture_thread is not None and _capture_thread.is_alive():
+        if _capture_thread != threading.current_thread():
+            _capture_thread.join(timeout=2.0)
+        _capture_thread = None
+    with _capture_lock:
+        if _capture is not None:
+            try:
+                _capture.release()
+            except Exception:
+                pass
+            _capture = None
+        _source_type = "none"
 
 _overlay_toggles = {
     "showBoxes":    True,
@@ -140,50 +160,71 @@ def _capture_loop():
             elapsed = time.perf_counter() - _capture_loop.start_time
             target_frame = int(elapsed * video_fps)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
+
             if total_frames > 0 and target_frame >= total_frames:
-                # Reset video looping by re-opening capture cleanly under lock
+                # Reset video looping cleanly via seek without tearing down FFmpeg contexts
                 _capture_loop.start_time = time.perf_counter()
                 target_frame = 0
-                with _capture_lock:
-                    if _capture is not None:
-                        _capture.release()
-                    _capture = _open_capture("upload", _source_path)
-                    cap = _capture
                 _capture_loop.last_frame_idx = 0
+                with _capture_lock:
+                    if cap is not None and cap.isOpened():
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
             # Discard frames that we need to skip using fast cap.grab()
             skip_count = target_frame - _capture_loop.last_frame_idx - 1
             if skip_count > 0:
-                actual_skip = min(skip_count, 30) # cap to prevent lockups
+                actual_skip = min(skip_count, 15)  # conservative skip to avoid decoder pipeline starvation
                 for _ in range(actual_skip):
-                    cap.grab()
+                    if not _running.is_set():
+                        break
+                    with _capture_lock:
+                        if cap is None or not cap.isOpened():
+                            break
+                        if not cap.grab():
+                            break
                 _capture_loop.last_frame_idx += actual_skip
 
-            ret, frame = cap.read()
+            if not _running.is_set():
+                break
+
+            with _capture_lock:
+                if cap is None or not cap.isOpened():
+                    break
+                ret, frame = cap.read()
+
             if ret:
                 _capture_loop.last_frame_idx += 1
             else:
-                # Restart if reading fails at end of stream by re-opening capture cleanly under lock
+                # Seek back to frame 0 for smooth continuous playback
                 _capture_loop.start_time = time.perf_counter()
-                with _capture_lock:
-                    if _capture is not None:
-                        _capture.release()
-                    _capture = _open_capture("upload", _source_path)
-                    cap = _capture
                 _capture_loop.last_frame_idx = 0
-                ret, frame = cap.read()
-                if ret:
-                    _capture_loop.last_frame_idx = 1
+                with _capture_lock:
+                    if cap is not None and cap.isOpened():
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                        if ret:
+                            _capture_loop.last_frame_idx = 1
         else:
             # For live webcam/espcam sources, clear OpenCV buffer to get latest live frame
             if _source_type in ["webcam", "espcam"]:
-                for _ in range(4): # typically buffer size is 5
-                    cap.grab()
-            ret, frame = cap.read()
+                for _ in range(3):
+                    if not _running.is_set():
+                        break
+                    with _capture_lock:
+                        if cap is None or not cap.isOpened():
+                            break
+                        cap.grab()
 
-        if not ret:
-            time.sleep(0.05)
+            if not _running.is_set():
+                break
+
+            with _capture_lock:
+                if cap is None or not cap.isOpened():
+                    break
+                ret, frame = cap.read()
+
+        if not ret or frame is None:
+            time.sleep(0.04)
             continue
 
         # Run perception pipeline
@@ -298,7 +339,10 @@ def _open_capture(source_type: str, path_or_url: str) -> cv2.VideoCapture:
         url = path_or_url or cfg.ESPCAM_URL
         cap = cv2.VideoCapture(url)
     elif source_type == "upload":
-        cap = cv2.VideoCapture(path_or_url)
+        p = Path(path_or_url)
+        if not p.is_file():
+            p = cfg.UPLOAD_FOLDER / path_or_url
+        cap = cv2.VideoCapture(str(p))
     else:
         raise ValueError(f"Unknown source type: {source_type}")
 
@@ -329,14 +373,14 @@ def api_status():
 
 @app.route("/api/video/start", methods=["POST"])
 def api_start():
-    global _capture, _source_type, _source_path
-
-    if _running.is_set():
-        return jsonify({"error": "Already running"}), 400
+    global _capture, _source_type, _source_path, _capture_thread
 
     data = request.get_json(silent=True) or {}
     source_type  = data.get("source", "webcam")
     path_or_url  = data.get("url", "")
+
+    # Cleanly stop any existing capture thread
+    _stop_capture_thread()
 
     try:
         cap = _open_capture(source_type, path_or_url)
@@ -350,8 +394,8 @@ def api_start():
         _source_path = path_or_url
 
     _running.set()
-    t = threading.Thread(target=_capture_loop, daemon=True, name="capture-loop")
-    t.start()
+    _capture_thread = threading.Thread(target=_capture_loop, daemon=True, name="capture-loop")
+    _capture_thread.start()
 
     _append_operation_log(f"[Video] Pipeline started - source: {source_type.upper()}")
     log.info("Video processing started: source=%s", source_type)
@@ -360,17 +404,7 @@ def api_start():
 
 @app.route("/api/video/stop", methods=["POST"])
 def api_stop():
-    global _capture, _source_type
-
-    _running.clear()
-    time.sleep(0.15)
-
-    with _capture_lock:
-        if _capture:
-            _capture.release()
-            _capture = None
-        _source_type = "none"
-
+    _stop_capture_thread()
     _append_operation_log("[Video] Pipeline stopped by operator")
     log.info("Video processing stopped.")
     return jsonify({"status": "stopped"})
@@ -378,7 +412,7 @@ def api_stop():
 
 @app.route("/api/video/upload", methods=["POST"])
 def api_upload():
-    global _capture, _source_type, _source_path
+    global _capture, _source_type, _source_path, _capture_thread
 
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
@@ -392,14 +426,8 @@ def api_upload():
     log.info("Uploaded video saved: %s", save_path)
     _append_operation_log(f"[Upload] Video uploaded: {f.filename}")
 
-    # Stop existing capture if any
-    if _running.is_set():
-        _running.clear()
-        time.sleep(0.15)
-        with _capture_lock:
-            if _capture:
-                _capture.release()
-                _capture = None
+    # Deterministically stop existing capture before opening new upload
+    _stop_capture_thread()
 
     try:
         cap = _open_capture("upload", str(save_path))
@@ -412,8 +440,8 @@ def api_upload():
         _source_path = str(save_path)
 
     _running.set()
-    t = threading.Thread(target=_capture_loop, daemon=True, name="capture-loop-upload")
-    t.start()
+    _capture_thread = threading.Thread(target=_capture_loop, daemon=True, name="capture-loop-upload")
+    _capture_thread.start()
 
     _append_operation_log(f"[Video] Pipeline started - source: UPLOAD ({f.filename})")
     return jsonify({"status": "started", "source": "upload", "filename": f.filename})
@@ -557,6 +585,15 @@ def index_redirect():
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="RoadEye ADAS Backend Server")
+    parser.add_argument("--host", default=cfg.HOST, help="Host to bind to")
+    parser.add_argument("--port", type=int, default=cfg.PORT, help="Port to bind to (default 5001)")
+    args = parser.parse_args()
+
+    host = args.host
+    port = args.port
+
     log.info("=" * 60)
     log.info(" RoadEye ADAS Backend — starting up")
     log.info("=" * 60)
@@ -569,9 +606,9 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    log.info("Server listening on http://%s:%d", cfg.HOST, cfg.PORT)
-    log.info("MJPEG stream: http://localhost:%d/stream/video", cfg.PORT)
-    log.info("WebSocket:    ws://localhost:%d/ws/telemetry", cfg.PORT)
+    log.info("Server listening on http://%s:%d", host, port)
+    log.info("MJPEG stream: http://localhost:%d/stream/video", port)
+    log.info("WebSocket:    ws://localhost:%d/ws/telemetry", port)
 
     # Use threaded=True so WebSocket + MJPEG can coexist
-    app.run(host=cfg.HOST, port=cfg.PORT, threaded=True, use_reloader=False)
+    app.run(host=host, port=port, threaded=True, use_reloader=False)

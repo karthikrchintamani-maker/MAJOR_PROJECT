@@ -38,6 +38,10 @@ PT_MODEL_PATHS = {
 # ─── Inference Thresholds ─────────────────────────────────────────────────────
 CONF_THRESH = float(os.environ.get("ROADEYE_CONF", 0.40))
 NMS_THRESH  = float(os.environ.get("ROADEYE_NMS",  0.45))
+POTHOLE_CONF_THRESH = float(os.environ.get("ROADEYE_POTHOLE_CONF", 0.25))
+POTHOLE_NMS_THRESH  = float(os.environ.get("ROADEYE_POTHOLE_NMS",  0.40))
+POTHOLE_TARGET_CLASSES = [3, 4]  # 3: Pothole, 4: Other road surface distress
+POTHOLE_DEBUG_LOGGING = os.environ.get("ROADEYE_POTHOLE_DEBUG", "true").lower() == "true"
 INPUT_SIZE  = (640, 640)          # NCHW model input
 
 # ─── Camera ───────────────────────────────────────────────────────────────────
