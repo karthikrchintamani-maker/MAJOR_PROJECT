@@ -2,8 +2,11 @@
 RoadEye Model Loader
 Attempts to load ONNX models via onnxruntime, then PyTorch, then flags simulation.
 Gracefully degrades when models are Git LFS stubs or packages are missing.
+
+GPU-optimised for: NVIDIA RTX 4050 (6 GB) + i7-13650HX (20 threads)
 """
 import logging
+import multiprocessing
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Any
@@ -15,7 +18,6 @@ from config import (
 )
 
 log = logging.getLogger("roadeye.models")
-
 
 # ─── Try to import optional inference backends ────────────────────────────────
 try:
@@ -31,6 +33,52 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+
+# ─── Provider detection ───────────────────────────────────────────────────────
+def _get_providers():
+    """
+    Auto-detect best available execution provider.
+    Priority: CUDA (RTX 4050) > CPU
+    """
+    if not ORT_AVAILABLE:
+        return ["CPUExecutionProvider"]
+
+    available = ort.get_available_providers()
+    log.info(f"Available ORT providers: {available}")
+
+    # RTX 4050 — use CUDA with tuned settings
+    if "CUDAExecutionProvider" in available:
+        cuda_opts = {
+            "device_id": 0,
+            "arena_extend_strategy": "kNextPowerOfTwo",
+            "gpu_mem_limit": 4 * 1024 * 1024 * 1024,  # 4 GB of 6 GB VRAM
+            "cudnn_conv_algo_search": "EXHAUSTIVE",
+            "do_copy_in_default_stream": True,
+        }
+        log.info("✅ RTX 4050 CUDA provider active — GPU inference enabled!")
+        return [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+
+    log.info("CUDA not available — using optimised CPU (i7-13650HX, 20 threads)")
+    return ["CPUExecutionProvider"]
+
+
+# ─── Optimised session options ────────────────────────────────────────────────
+def _make_sess_opts():
+    """
+    Session options tuned for i7-13650HX (6 P-cores + 8 E-cores = 20 threads).
+    When CUDA is active, CPU threads handle pre/post-processing.
+    """
+    _cores = multiprocessing.cpu_count()          # 20 on i7-13650HX
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads     = _cores
+    opts.inter_op_num_threads     = _cores
+    opts.execution_mode           = ort.ExecutionMode.ORT_PARALLEL
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.enable_cpu_mem_arena     = True
+    opts.enable_mem_pattern       = True
+    opts.enable_mem_reuse         = True
+    return opts
 
 
 # ─── Model Descriptor ─────────────────────────────────────────────────────────
@@ -51,18 +99,15 @@ def _load_onnx(path: Path, name: str) -> Optional[ModelInfo]:
         log.warning(f"[{name}] ONNX file is a Git LFS stub — skipping ONNX load.")
         return None
     try:
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        
-        # Optimize ONNX runtime options for Raspberry Pi 5 quad-core ARM layout
-        sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = 4
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        sess = ort.InferenceSession(str(path), sess_options=sess_options, providers=providers)
-        input_name  = sess.get_inputs()[0].name
+        providers = _get_providers()
+        sess = ort.InferenceSession(str(path), sess_options=_make_sess_opts(), providers=providers)
+        input_name   = sess.get_inputs()[0].name
         output_names = [o.name for o in sess.get_outputs()]
-        log.info(f"[{name}] ✅ Loaded ONNX model from {path}")
+
+        # Log which device actually loaded the model
+        active = sess.get_providers()
+        device = "🟢 GPU (CUDA)" if "CUDAExecutionProvider" in active else "🔵 CPU"
+        log.info(f"[{name}] ✅ Loaded ONNX | device={device} | path={path.name}")
         return ModelInfo(name=name, backend="onnx", session=sess,
                          input_name=input_name, output_names=output_names)
     except Exception as e:

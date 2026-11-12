@@ -42,10 +42,35 @@ POTHOLE_CONF_THRESH = float(os.environ.get("ROADEYE_POTHOLE_CONF", 0.25))
 POTHOLE_NMS_THRESH  = float(os.environ.get("ROADEYE_POTHOLE_NMS",  0.40))
 POTHOLE_TARGET_CLASSES = [3, 4]  # 3: Pothole, 4: Other road surface distress
 POTHOLE_DEBUG_LOGGING = os.environ.get("ROADEYE_POTHOLE_DEBUG", "true").lower() == "true"
-INPUT_SIZE  = (640, 640)          # NCHW model input
+INPUT_SIZE  = (640, 640)          # NCHW model input (fixed — YOLO models require 640×640)
 
 # ─── Camera ───────────────────────────────────────────────────────────────────
-WEBCAM_INDEX = int(os.environ.get("ROADEYE_WEBCAM", 0))
+def _auto_detect_webcam() -> int:
+    """
+    Scan camera indices 0-4 and return the highest valid index.
+    External USB webcams on Windows always get a higher index than the built-in cam.
+    Does NOT hold the camera open — just checks and releases immediately.
+    """
+    env_val = os.environ.get("ROADEYE_WEBCAM")
+    if env_val is not None:
+        return int(env_val)
+
+    import cv2
+    found = []
+    for i in range(5):
+        cap = cv2.VideoCapture(i)   # No backend flag — most compatible
+        if cap.isOpened():
+            found.append(i)
+        cap.release()
+
+    if not found:
+        return 0
+
+    # Prefer external USB cam (highest index) when multiple found
+    idx = found[-1] if len(found) > 1 else found[0]
+    return idx
+
+WEBCAM_INDEX = _auto_detect_webcam()
 ESPCAM_URL   = os.environ.get("ROADEYE_ESPCAM", "http://192.168.4.2/stream")
 UPLOAD_FOLDER = BACKEND_DIR / "uploads"
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)

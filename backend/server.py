@@ -329,12 +329,19 @@ def _broadcast_telemetry(result: InferenceResult):
 
 
 # ─── Helper: open a capture ───────────────────────────────────────────────────
-def _open_capture(source_type: str, path_or_url: str) -> cv2.VideoCapture:
+def _open_capture(source_type: str, path_or_url: str, camera_index: int = None) -> cv2.VideoCapture:
     if source_type == "webcam":
-        cap = cv2.VideoCapture(cfg.WEBCAM_INDEX)
+        cam_idx = int(camera_index) if camera_index is not None else cfg.WEBCAM_INDEX
+        cfg.WEBCAM_INDEX = cam_idx
+        # On Windows, try CAP_DSHOW first for reliable multi-camera indexing
+        cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(cam_idx)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        log.info(f"Opening webcam index {cam_idx}")
     elif source_type == "espcam":
         url = path_or_url or cfg.ESPCAM_URL
         cap = cv2.VideoCapture(url)
@@ -347,13 +354,61 @@ def _open_capture(source_type: str, path_or_url: str) -> cv2.VideoCapture:
         raise ValueError(f"Unknown source type: {source_type}")
 
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open capture: {source_type} / {path_or_url}")
+        raise RuntimeError(f"Could not open capture: {source_type} (index: {camera_index if camera_index is not None else cfg.WEBCAM_INDEX}) / {path_or_url}")
     return cap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #   REST API Routes
 # ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/cameras", methods=["GET"])
+def api_get_cameras():
+    """Detect all available cameras and friendly names."""
+    names = []
+    try:
+        import subprocess
+        res = subprocess.run(["pnputil", "/enum-devices", "/class", "Camera"], capture_output=True, text=True, timeout=3)
+        for line in res.stdout.splitlines():
+            if "Device Description:" in line:
+                names.append(line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+
+    cameras = []
+    # If a camera is currently open, include it directly
+    active_idx = cfg.WEBCAM_INDEX
+    for idx in range(5):
+        if _running.is_set() and _source_type == "webcam" and idx == active_idx:
+            # Active camera is in use by capture loop
+            name = names[idx] if idx < len(names) else f"Camera {idx}"
+            cameras.append({
+                "index": idx,
+                "name": name,
+                "label": f"{name} (Index {idx})"
+            })
+            continue
+
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            name = names[len(cameras)] if len(cameras) < len(names) else f"Camera {idx}"
+            cameras.append({
+                "index": idx,
+                "name": name,
+                "label": f"{name} (Index {idx})"
+            })
+            cap.release()
+
+    if not cameras:
+        cameras.append({"index": 0, "name": "Default Webcam", "label": "Default Webcam (Index 0)"})
+
+    return jsonify({
+        "cameras": cameras,
+        "default_index": cfg.WEBCAM_INDEX
+    })
+
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
@@ -362,12 +417,13 @@ def api_status():
     with _frame_lock:
         res = _latest_result
     return jsonify({
-        "status":    "online",
-        "running":   _running.is_set(),
-        "source":    _source_type,
-        "models":    model_info,
-        "fps":       res.fps if res else 0,
-        "riskScore": res.risk_score if res else 0,
+        "status":      "online",
+        "running":     _running.is_set(),
+        "source":      _source_type,
+        "webcam_index": cfg.WEBCAM_INDEX,
+        "models":      model_info,
+        "fps":         res.fps if res else 0,
+        "riskScore":   res.risk_score if res else 0,
     })
 
 
@@ -378,12 +434,13 @@ def api_start():
     data = request.get_json(silent=True) or {}
     source_type  = data.get("source", "webcam")
     path_or_url  = data.get("url", "")
+    camera_index = data.get("camera_index", None)
 
     # Cleanly stop any existing capture thread
     _stop_capture_thread()
 
     try:
-        cap = _open_capture(source_type, path_or_url)
+        cap = _open_capture(source_type, path_or_url, camera_index)
     except Exception as e:
         log.error(f"Cannot open capture: {e}")
         return jsonify({"error": str(e)}), 500
@@ -397,9 +454,10 @@ def api_start():
     _capture_thread = threading.Thread(target=_capture_loop, daemon=True, name="capture-loop")
     _capture_thread.start()
 
-    _append_operation_log(f"[Video] Pipeline started - source: {source_type.upper()}")
-    log.info("Video processing started: source=%s", source_type)
-    return jsonify({"status": "started", "source": source_type})
+    cam_log_str = f" (Index: {camera_index})" if source_type == "webcam" and camera_index is not None else ""
+    _append_operation_log(f"[Video] Pipeline started - source: {source_type.upper()}{cam_log_str}")
+    log.info("Video processing started: source=%s%s", source_type, cam_log_str)
+    return jsonify({"status": "started", "source": source_type, "webcam_index": cfg.WEBCAM_INDEX})
 
 
 @app.route("/api/video/stop", methods=["POST"])

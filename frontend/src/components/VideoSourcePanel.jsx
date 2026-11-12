@@ -1,7 +1,7 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Video, Webcam, Radio, Upload, Play, Square,
-  Link, CheckCircle, XCircle, Loader, AlertTriangle
+  Link, CheckCircle, XCircle, Loader, AlertTriangle, RefreshCw
 } from 'lucide-react';
 
 const BACKEND_BASE = 'http://localhost:5001';
@@ -14,7 +14,39 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
   const [error, setError] = useState('');
   const [uploadedFile, setUploadedFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
+  const [cameras, setCameras] = useState([]);
+  const [selectedCam, setSelectedCam] = useState(0);
+  const [loadingCams, setLoadingCams] = useState(false);
   const fileRef = useRef(null);
+
+  const fetchCameras = async () => {
+    if (!backendOnline) return;
+    setLoadingCams(true);
+    try {
+      const resp = await fetch(`${BACKEND_BASE}/api/cameras`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.cameras && data.cameras.length > 0) {
+          setCameras(data.cameras);
+          if (data.default_index !== undefined) {
+            setSelectedCam(data.default_index);
+          } else {
+            setSelectedCam(data.cameras[0].index);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch cameras:', e);
+    } finally {
+      setLoadingCams(false);
+    }
+  };
+
+  useEffect(() => {
+    if (backendOnline) {
+      fetchCameras();
+    }
+  }, [backendOnline]);
 
   const startProcessing = async () => {
     if (!backendOnline) {
@@ -35,6 +67,7 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             source,
+            camera_index: selectedCam,
             url: source === 'espcam' ? espcamUrl : '',
           }),
         });
@@ -116,11 +149,53 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
       {/* Source-specific config */}
       <div className="flex flex-col gap-2">
         {source === 'webcam' && (
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
-            <div className="flex items-center gap-2 text-[10px] font-mono text-slate-400">
-              <Video className="w-3.5 h-3.5 text-primaryaccent" />
-              <span>Using system default webcam (index 0)</span>
+          <div className="bg-white/5 rounded-xl p-3 border border-white/10 flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5 text-[9px] font-mono text-slate-400 font-bold uppercase tracking-wider">
+                <Video className="w-3 h-3 text-primaryaccent" />
+                <span>Camera Input Device</span>
+              </div>
+              <button
+                onClick={fetchCameras}
+                disabled={loadingCams || running}
+                className="flex items-center gap-1 text-[9px] font-mono text-cyan-400 hover:text-cyan-300 disabled:opacity-40 transition-colors cursor-pointer"
+                title="Scan for connected cameras"
+              >
+                <RefreshCw className={`w-2.5 h-2.5 ${loadingCams ? 'animate-spin' : ''}`} />
+                <span>{loadingCams ? 'Scanning...' : 'Scan'}</span>
+              </button>
             </div>
+
+            {cameras.length > 0 ? (
+              <div className="flex flex-col gap-1.5">
+                <select
+                  value={selectedCam}
+                  onChange={(e) => setSelectedCam(Number(e.target.value))}
+                  disabled={running}
+                  className="w-full bg-darkbg border border-borderblue rounded-lg px-2.5 py-1.5 text-[10px] font-mono text-slate-200 focus:outline-none focus:border-primaryaccent disabled:opacity-50 cursor-pointer"
+                >
+                  {cameras.map((cam) => (
+                    <option key={cam.index} value={cam.index} className="bg-slate-900 text-slate-200">
+                      📷 {cam.label || `Camera ${cam.index}`}
+                    </option>
+                  ))}
+                </select>
+                <div className="flex items-center justify-between text-[8px] font-mono text-slate-400 px-0.5">
+                  <span>Selected: <span className="text-cyan-300 font-bold">Index {selectedCam}</span></span>
+                  <span className="text-emerald-400 font-bold">● {cameras.length} camera(s) detected</span>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                <span>Default Webcam (index {selectedCam})</span>
+                <button
+                  onClick={fetchCameras}
+                  className="text-[9px] text-cyan-400 underline cursor-pointer"
+                >
+                  Click to detect
+                </button>
+              </div>
+            )}
           </div>
         )}
 
