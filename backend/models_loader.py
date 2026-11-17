@@ -351,3 +351,64 @@ def decode_yolo_detect_output(output: np.ndarray,
         return filter_containment(results)
 
     return []
+
+
+def decode_yolo_seg(outs: list[np.ndarray],
+                    orig_hw: tuple,
+                    conf_thresh: float = 0.40,
+                    letterbox_meta: tuple | None = None) -> np.ndarray:
+    """
+    Decodes YOLOv8 / YOLO11 segmentation output into a full-resolution binary road mask.
+    outs[0]: [1, 37, 8400] where 37 = 4 (bbox) + 1 (road score) + 32 (coeffs)
+    outs[1]: [1, 32, 160, 160] (prototype masks)
+    Returns: binary mask uint8 (H, W) where 1 is drivable road, 0 is background.
+    """
+    import cv2
+    oh, ow = orig_hw
+    out0 = outs[0][0]      # (37, 8400)
+    proto = outs[1][0]     # (32, 160, 160)
+
+    # Class score is row 4 (1 class: Road)
+    scores = out0[4]       # (8400,)
+    mask_indices = np.where(scores >= conf_thresh)[0]
+
+    if len(mask_indices) == 0:
+        return np.zeros((oh, ow), dtype=np.uint8)
+
+    # Take top scoring road predictions (max 4 to keep performance high)
+    top_indices = mask_indices[np.argsort(scores[mask_indices])[::-1][:4]]
+    combined_mask = np.zeros((160, 160), dtype=np.float32)
+
+    for idx in top_indices:
+        coeffs = out0[5:37, idx]
+        mask_logit = np.tensordot(coeffs, proto, axes=(0, 0))
+        mask = 1.0 / (1.0 + np.exp(-np.clip(mask_logit, -20.0, 20.0)))
+
+        cx, cy, bw, bh = out0[:4, idx]
+        s = 160.0 / 640.0
+        x1 = max(0, int((cx - bw / 2.0) * s))
+        y1 = max(0, int((cy - bh / 2.0) * s))
+        x2 = min(160, int((cx + bw / 2.0) * s))
+        y2 = min(160, int((cy + bh / 2.0) * s))
+
+        box_mask = np.zeros((160, 160), dtype=np.float32)
+        box_mask[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
+        combined_mask = np.maximum(combined_mask, box_mask)
+
+    binary_160 = (combined_mask > 0.5).astype(np.uint8)
+
+    # Perspective sanity: road surface is on ground plane, never in upper 25% of view
+    binary_160[:int(160 * 0.25), :] = 0
+
+    if letterbox_meta is not None:
+        r, (dw, dh) = letterbox_meta
+        scale = 160.0 / 640.0
+        dw_160 = int(round(dw * scale))
+        dh_160 = int(round(dh * scale))
+        h_unpad = 160 - 2 * dh_160
+        w_unpad = 160 - 2 * dw_160
+        if h_unpad > 0 and w_unpad > 0:
+            unpadded = binary_160[dh_160:dh_160 + h_unpad, dw_160:dw_160 + w_unpad]
+            return cv2.resize(unpadded, (ow, oh), interpolation=cv2.INTER_NEAREST)
+
+    return cv2.resize(binary_160, (ow, oh), interpolation=cv2.INTER_NEAREST)

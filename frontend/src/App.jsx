@@ -517,6 +517,7 @@ export default function App() {
               <VideoSourcePanel
                 onSourceChanged={handleSourceChanged}
                 backendOnline={backendOnline}
+                isRunning={streamActive}
               />
             </div>
             <div className="col-span-8 h-full min-h-0 flex flex-col gap-3">

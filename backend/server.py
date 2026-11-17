@@ -88,6 +88,9 @@ _pipeline: RoadEyePipeline | None = None
 _capture_lock = threading.Lock()
 _capture: cv2.VideoCapture | None = None
 _capture_thread: threading.Thread | None = None
+_camera_reader_thread: threading.Thread | None = None
+_latest_raw_camera_frame: np.ndarray | None = None
+_latest_raw_camera_lock = threading.Lock()
 _source_type: str = "none"       # "webcam" | "espcam" | "upload"
 _source_path: str = ""           # file path or URL
 
@@ -100,20 +103,29 @@ _frame_lock = threading.Lock()
 
 def _stop_capture_thread():
     """Safely and deterministically stop any active capture thread and release hardware."""
-    global _capture_thread, _capture, _source_type
+    global _capture_thread, _camera_reader_thread, _capture, _source_type
     _running.clear()
+    if _camera_reader_thread is not None and _camera_reader_thread.is_alive():
+        if _camera_reader_thread != threading.current_thread():
+            _camera_reader_thread.join(timeout=2.0)
+        _camera_reader_thread = None
     if _capture_thread is not None and _capture_thread.is_alive():
         if _capture_thread != threading.current_thread():
-            _capture_thread.join(timeout=2.0)
+            _capture_thread.join(timeout=3.0)
         _capture_thread = None
+    with _latest_raw_camera_lock:
+        global _latest_raw_camera_frame
+        _latest_raw_camera_frame = None
     with _capture_lock:
         if _capture is not None:
             try:
                 _capture.release()
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Error releasing capture: {e}")
             _capture = None
         _source_type = "none"
+    # Essential pause for Windows DirectShow driver to cleanly detach hardware
+    time.sleep(0.35)
 
 _overlay_toggles = {
     "showBoxes":    True,
@@ -133,6 +145,26 @@ def _init_models():
     _models = load_all_models()
     _pipeline = RoadEyePipeline(_models)
     log.info("Pipeline ready.")
+
+
+# ─── Camera Background Reader (Zero Latency Buffer Drain) ─────────────────────
+def _camera_reader_loop():
+    """Continuously drains the physical camera buffer at native 30 FPS to guarantee 0ms latency."""
+    global _latest_raw_camera_frame
+    log.info("Camera background reader thread started.")
+    while _running.is_set():
+        with _capture_lock:
+            cap = _capture
+        if cap is None or not cap.isOpened():
+            time.sleep(0.01)
+            continue
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            with _latest_raw_camera_lock:
+                _latest_raw_camera_frame = frame
+        else:
+            time.sleep(0.005)
+    log.info("Camera background reader thread exited.")
 
 
 # ─── Video Capture Thread ─────────────────────────────────────────────────────
@@ -205,23 +237,24 @@ def _capture_loop():
                         if ret:
                             _capture_loop.last_frame_idx = 1
         else:
-            # For live webcam/espcam sources, clear OpenCV buffer to get latest live frame
-            if _source_type in ["webcam", "espcam"]:
-                for _ in range(3):
-                    if not _running.is_set():
-                        break
-                    with _capture_lock:
-                        if cap is None or not cap.isOpened():
-                            break
-                        cap.grab()
-
             if not _running.is_set():
                 break
 
-            with _capture_lock:
-                if cap is None or not cap.isOpened():
-                    break
-                ret, frame = cap.read()
+            frame = None
+            if _camera_reader_thread is not None and _camera_reader_thread.is_alive():
+                with _latest_raw_camera_lock:
+                    if _latest_raw_camera_frame is not None:
+                        frame = _latest_raw_camera_frame
+                        _latest_raw_camera_frame = None
+                if frame is None:
+                    time.sleep(0.005)
+                    continue
+                ret = True
+            else:
+                with _capture_lock:
+                    if cap is None or not cap.isOpened():
+                        break
+                    ret, frame = cap.read()
 
         if not ret or frame is None:
             time.sleep(0.04)
@@ -332,16 +365,38 @@ def _broadcast_telemetry(result: InferenceResult):
 def _open_capture(source_type: str, path_or_url: str, camera_index: int = None) -> cv2.VideoCapture:
     if source_type == "webcam":
         cam_idx = int(camera_index) if camera_index is not None else cfg.WEBCAM_INDEX
-        cfg.WEBCAM_INDEX = cam_idx
-        # On Windows, try CAP_DSHOW first for reliable multi-camera indexing
+        log.info(f"Opening webcam index {cam_idx} (requested: {camera_index})")
+
+        # Try DirectShow first (preserves physical camera index ordering on Windows)
         cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
         if not cap.isOpened():
+            log.warning(f"CAP_DSHOW failed for index {cam_idx}, trying MSMF")
+            cap = cv2.VideoCapture(cam_idx, cv2.CAP_MSMF)
+        if not cap.isOpened():
+            log.warning(f"CAP_MSMF failed for index {cam_idx}, trying default backend")
             cap = cv2.VideoCapture(cam_idx)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open camera device at index {cam_idx}. Check USB connection and privacy permissions.")
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        log.info(f"Opening webcam index {cam_idx}")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Test read and warm up camera sensor to ensure auto-exposure/gain stabilize
+        test_frame = None
+        for _ in range(5):
+            ret, test_frame = cap.read()
+            if ret and test_frame is not None:
+                break
+            time.sleep(0.1)
+
+        if not ret or test_frame is None:
+            cap.release()
+            raise RuntimeError(f"Camera index {cam_idx} opened but cannot read video frames.")
+
+        cfg.WEBCAM_INDEX = cam_idx
+        log.info(f"Successfully opened and verified webcam index {cam_idx} ({test_frame.shape[1]}x{test_frame.shape[0]})")
     elif source_type == "espcam":
         url = path_or_url or cfg.ESPCAM_URL
         cap = cv2.VideoCapture(url)
@@ -364,42 +419,53 @@ def _open_capture(source_type: str, path_or_url: str, camera_index: int = None) 
 
 @app.route("/api/cameras", methods=["GET"])
 def api_get_cameras():
-    """Detect all available cameras and friendly names."""
-    names = []
-    try:
-        import subprocess
-        res = subprocess.run(["pnputil", "/enum-devices", "/class", "Camera"], capture_output=True, text=True, timeout=3)
-        for line in res.stdout.splitlines():
-            if "Device Description:" in line:
-                names.append(line.split(":", 1)[1].strip())
-    except Exception:
-        pass
-
+    """Detect all available cameras and friendly names without locking device handles."""
     cameras = []
-    # If a camera is currently open, include it directly
-    active_idx = cfg.WEBCAM_INDEX
-    for idx in range(5):
-        if _running.is_set() and _source_type == "webcam" and idx == active_idx:
-            # Active camera is in use by capture loop
-            name = names[idx] if idx < len(names) else f"Camera {idx}"
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoInitialize(None)
+        from pygrabber.dshow_graph import FilterGraph
+        graph = FilterGraph()
+        devices = graph.get_input_devices()
+        for idx, name in enumerate(devices):
+            clean_name = name.strip()
+            # Distinguish external USB from built-in laptop camera clearly
+            if "usb" in clean_name.lower():
+                tag = "External USB WebCam"
+            elif "hd" in clean_name.lower() or "integrated" in clean_name.lower():
+                tag = "Built-in Laptop Camera"
+            else:
+                tag = f"Camera {idx}"
             cameras.append({
                 "index": idx,
-                "name": name,
-                "label": f"{name} (Index {idx})"
+                "name": clean_name,
+                "label": f"{clean_name} (Index {idx}) — {tag}",
+                "tag": tag
             })
-            continue
+    except Exception as e:
+        log.warning(f"pygrabber discovery failed, falling back to pnputil/opencv: {e}")
 
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
-            name = names[len(cameras)] if len(cameras) < len(names) else f"Camera {idx}"
+    if not cameras:
+        # Fallback to pnputil + OpenCV probe
+        names = []
+        try:
+            import subprocess
+            res = subprocess.run(["pnputil", "/enum-devices", "/class", "Camera"], capture_output=True, text=True, timeout=3)
+            for line in res.stdout.splitlines():
+                if "Device Description:" in line:
+                    names.append(line.split(":", 1)[1].strip())
+        except Exception:
+            pass
+
+        for idx in range(3):
+            name = names[idx] if idx < len(names) else f"Camera {idx}"
+            tag = "External USB WebCam" if "usb" in name.lower() else "Built-in Laptop Camera"
             cameras.append({
                 "index": idx,
                 "name": name,
-                "label": f"{name} (Index {idx})"
+                "label": f"{name} (Index {idx}) — {tag}",
+                "tag": tag
             })
-            cap.release()
 
     if not cameras:
         cameras.append({"index": 0, "name": "Default Webcam", "label": "Default Webcam (Index 0)"})
@@ -451,6 +517,11 @@ def api_start():
         _source_path = path_or_url
 
     _running.set()
+    if source_type in ("webcam", "espcam"):
+        with _latest_raw_camera_lock:
+            _latest_raw_camera_frame = None
+        _camera_reader_thread = threading.Thread(target=_camera_reader_loop, daemon=True, name="camera-reader")
+        _camera_reader_thread.start()
     _capture_thread = threading.Thread(target=_capture_loop, daemon=True, name="capture-loop")
     _capture_thread.start()
 
@@ -546,49 +617,67 @@ def api_set_espcam():
 
 # ─── MJPEG Stream ────────────────────────────────────────────────────────────
 def _mjpeg_generator():
-    boundary = b"--RoadEyeFrame\r\n"
-    header_tpl = (
-        b"Content-Type: image/jpeg\r\n"
-        b"Content-Length: %d\r\n\r\n"
-    )
+    boundary = b"--frame"
 
-    # Placeholder frame when pipeline isn't running
+    # Placeholder frame when pipeline isn't running or first frame pending
     blank = np.zeros((480, 640, 3), dtype=np.uint8)
-    cv2.putText(blank, "RoadEye — Waiting for Video Source",
-                (60, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 229, 255), 2)
-    cv2.putText(blank, "Select source from dashboard to begin",
-                (110, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 120, 120), 1)
+    cv2.putText(blank, "RoadEye Perception Engine Active",
+                (60, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 229, 255), 2)
+    cv2.putText(blank, "Awaiting video frames...",
+                (140, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 140, 140), 1)
     _, blank_buf = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 75])
     blank_bytes = blank_buf.tobytes()
 
     last_sent = None
-    while True:
-        with _frame_lock:
-            frame_bytes = _latest_jpeg
+    last_sent_time = 0.0
 
-        if frame_bytes is None:
-            frame_bytes = blank_bytes
+    try:
+        while True:
+            with _frame_lock:
+                frame_bytes = _latest_jpeg
 
-        if frame_bytes is not last_sent:
-            last_sent = frame_bytes
-            yield (boundary
-                   + header_tpl % len(frame_bytes)
-                   + frame_bytes
-                   + b"\r\n")
-        time.sleep(0.033)   # ~30 FPS limit on stream
+            current_data = frame_bytes if frame_bytes is not None else blank_bytes
+            now = time.time()
+
+            # Deliver immediately if new frame arrived or every 0.8s as keep-alive
+            if current_data is not last_sent or (now - last_sent_time) >= 0.8:
+                header = (
+                    boundary + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(current_data)).encode() + b"\r\n\r\n"
+                )
+                yield header + current_data + b"\r\n"
+                last_sent = current_data
+                last_sent_time = now
+
+            time.sleep(0.02)
+    except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+        pass
 
 
 @app.route("/stream/video")
 def stream_video():
-    return Response(
+    resp = Response(
         _mjpeg_generator(),
-        mimetype="multipart/x-mixed-replace; boundary=RoadEyeFrame",
-        headers={
-            "Cache-Control": "no-cache, no-store",
-            "Pragma": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        mimetype="multipart/x-mixed-replace; boundary=frame"
     )
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
+
+
+@app.route("/api/video/frame", methods=["GET"])
+def api_latest_frame():
+    with _frame_lock:
+        data = _latest_jpeg
+    if data is None:
+        return Response(status=204)
+    resp = Response(data, mimetype="image/jpeg")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 # ─── WebSocket Telemetry ──────────────────────────────────────────────────────

@@ -36,39 +36,69 @@ PT_MODEL_PATHS = {
 }
 
 # ─── Inference Thresholds ─────────────────────────────────────────────────────
-CONF_THRESH = float(os.environ.get("ROADEYE_CONF", 0.40))
+CONF_THRESH = float(os.environ.get("ROADEYE_CONF", 0.42))
 NMS_THRESH  = float(os.environ.get("ROADEYE_NMS",  0.45))
-POTHOLE_CONF_THRESH = float(os.environ.get("ROADEYE_POTHOLE_CONF", 0.25))
+POTHOLE_CONF_THRESH = float(os.environ.get("ROADEYE_POTHOLE_CONF", 0.20))
 POTHOLE_NMS_THRESH  = float(os.environ.get("ROADEYE_POTHOLE_NMS",  0.40))
 POTHOLE_TARGET_CLASSES = [3, 4]  # 3: Pothole, 4: Other road surface distress
 POTHOLE_DEBUG_LOGGING = os.environ.get("ROADEYE_POTHOLE_DEBUG", "true").lower() == "true"
 INPUT_SIZE  = (640, 640)          # NCHW model input (fixed — YOLO models require 640×640)
 
+# ADAS Target Classes: filter to actionable road obstacles and vulnerable users
+# Ignores roadside scenery like Tree (40), Wall (45), Building (6), Vegetation (43), etc.
+ROAD_TARGET_CLASSES = [
+    0,   # Ambulance
+    1,   # Autorickshaw
+    2,   # Barricade
+    3,   # Bike
+    7,   # Bus
+    10,  # Camel
+    11,  # Car
+    12,  # Cart
+    13,  # Cattle
+    15,  # Cycle
+    17,  # Dog
+    22,  # Goat
+    23,  # Horse
+    26,  # Manhole
+    27,  # MotorBike
+    29,  # Person
+    31,  # Rikshaw
+    32,  # Road Divider
+    34,  # Tempo
+    35,  # Tractor
+    36,  # Traffic POlice
+    37,  # Traffic Police
+    38,  # Traffic Sign Board
+    39,  # Traffic Signal
+    41,  # Truck
+    47,  # person
+]
+
 # ─── Camera ───────────────────────────────────────────────────────────────────
 def _auto_detect_webcam() -> int:
     """
-    Scan camera indices 0-4 and return the highest valid index.
-    External USB webcams on Windows always get a higher index than the built-in cam.
-    Does NOT hold the camera open — just checks and releases immediately.
+    Auto-detect the camera index.
+    Prefers external USB webcams over the built-in laptop camera.
+    Uses DirectShow device discovery (pygrabber) without locking hardware.
     """
     env_val = os.environ.get("ROADEYE_WEBCAM")
     if env_val is not None:
         return int(env_val)
 
-    import cv2
-    found = []
-    for i in range(5):
-        cap = cv2.VideoCapture(i)   # No backend flag — most compatible
-        if cap.isOpened():
-            found.append(i)
-        cap.release()
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        graph = FilterGraph()
+        devices = graph.get_input_devices()
+        for idx, name in enumerate(devices):
+            if "usb" in name.lower():
+                return idx
+        if devices:
+            return 0
+    except Exception:
+        pass
 
-    if not found:
-        return 0
-
-    # Prefer external USB cam (highest index) when multiple found
-    idx = found[-1] if len(found) > 1 else found[0]
-    return idx
+    return 1  # Default to external camera index 1
 
 WEBCAM_INDEX = _auto_detect_webcam()
 ESPCAM_URL   = os.environ.get("ROADEYE_ESPCAM", "http://192.168.4.2/stream")

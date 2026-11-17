@@ -6,18 +6,38 @@ import {
 
 const BACKEND_BASE = 'http://localhost:5001';
 
-export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
+export default function VideoSourcePanel({ onSourceChanged, backendOnline, isRunning }) {
   const [source, setSource] = useState('webcam');   // 'webcam'|'espcam'|'upload'
   const [espcamUrl, setEspcamUrl] = useState('http://192.168.4.2/stream');
-  const [running, setRunning] = useState(false);
+  const [running, setRunning] = useState(Boolean(isRunning));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [uploadedFile, setUploadedFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [cameras, setCameras] = useState([]);
-  const [selectedCam, setSelectedCam] = useState(0);
+  const [selectedCam, setSelectedCam] = useState(1);
   const [loadingCams, setLoadingCams] = useState(false);
   const fileRef = useRef(null);
+
+  // Sync running state from parent prop
+  useEffect(() => {
+    if (isRunning !== undefined) {
+      setRunning(isRunning);
+    }
+  }, [isRunning]);
+
+  // Sync state with backend on mount
+  useEffect(() => {
+    if (!backendOnline) return;
+    fetch(`${BACKEND_BASE}/api/status`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.running !== undefined) setRunning(data.running);
+        if (data.source && data.source !== 'none') setSource(data.source);
+        if (data.webcam_index !== undefined) setSelectedCam(data.webcam_index);
+      })
+      .catch(() => {});
+  }, [backendOnline]);
 
   const fetchCameras = async () => {
     if (!backendOnline) return;
@@ -28,11 +48,20 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
         const data = await resp.json();
         if (data.cameras && data.cameras.length > 0) {
           setCameras(data.cameras);
-          if (data.default_index !== undefined) {
-            setSelectedCam(data.default_index);
-          } else {
-            setSelectedCam(data.cameras[0].index);
-          }
+          setSelectedCam((prev) => {
+            // Keep user selection if it still exists in returned cameras
+            if (prev !== null && prev !== undefined && data.cameras.some(c => c.index === prev)) {
+              return prev;
+            }
+            // Auto-prefer external USB camera if connected
+            const usbCam = data.cameras.find(c =>
+              c.name.toLowerCase().includes('usb') ||
+              (c.tag && c.tag.toLowerCase().includes('usb'))
+            );
+            if (usbCam) return usbCam.index;
+            if (data.default_index !== undefined) return data.default_index;
+            return data.cameras[0].index;
+          });
         }
       }
     } catch (e) {
@@ -47,6 +76,36 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
       fetchCameras();
     }
   }, [backendOnline]);
+
+  const handleCameraChange = async (newIdx) => {
+    const idxNum = Number(newIdx);
+    setSelectedCam(idxNum);
+    setError('');
+
+    // If the pipeline is currently running with webcam, smoothly switch the backend camera
+    if (running && source === 'webcam') {
+      setLoading(true);
+      try {
+        const resp = await fetch(`${BACKEND_BASE}/api/video/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: 'webcam',
+            camera_index: idxNum,
+            url: '',
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Failed to switch camera');
+        setRunning(true);
+        onSourceChanged?.('webcam', true);
+      } catch (e) {
+        setError(e.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
 
   const startProcessing = async () => {
     if (!backendOnline) {
@@ -167,11 +226,40 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
             </div>
 
             {cameras.length > 0 ? (
-              <div className="flex flex-col gap-1.5">
+              <div className="flex flex-col gap-2">
+                {/* One-click camera switch pill buttons */}
+                <div className="grid grid-cols-2 gap-1.5">
+                  {cameras.map((cam) => {
+                    const isUsb = cam.name.toLowerCase().includes('usb') || (cam.tag && cam.tag.toLowerCase().includes('usb'));
+                    const isSelected = selectedCam === cam.index;
+                    return (
+                      <button
+                        key={cam.index}
+                        type="button"
+                        onClick={() => handleCameraChange(cam.index)}
+                        disabled={loading}
+                        className={`flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg text-[9px] font-mono font-bold border transition-all cursor-pointer ${
+                          isSelected
+                            ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-sm shadow-cyan-500/20'
+                            : 'bg-white/5 border-white/10 text-slate-400 hover:border-slate-500 hover:bg-white/10'
+                        } disabled:opacity-50 disabled:cursor-not-allowed`}
+                        title={cam.label}
+                      >
+                        <span>{isUsb ? '🔌' : '💻'}</span>
+                        <span className="truncate">{isUsb ? 'External USB' : 'Laptop Cam'}</span>
+                        <span className={`text-[8px] px-1 py-0.2 rounded ${isSelected ? 'bg-cyan-400/30 text-cyan-200' : 'bg-white/10 text-slate-500'}`}>
+                          #{cam.index}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Dropdown with full details */}
                 <select
                   value={selectedCam}
-                  onChange={(e) => setSelectedCam(Number(e.target.value))}
-                  disabled={running}
+                  onChange={(e) => handleCameraChange(Number(e.target.value))}
+                  disabled={loading}
                   className="w-full bg-darkbg border border-borderblue rounded-lg px-2.5 py-1.5 text-[10px] font-mono text-slate-200 focus:outline-none focus:border-primaryaccent disabled:opacity-50 cursor-pointer"
                 >
                   {cameras.map((cam) => (
@@ -180,8 +268,9 @@ export default function VideoSourcePanel({ onSourceChanged, backendOnline }) {
                     </option>
                   ))}
                 </select>
+
                 <div className="flex items-center justify-between text-[8px] font-mono text-slate-400 px-0.5">
-                  <span>Selected: <span className="text-cyan-300 font-bold">Index {selectedCam}</span></span>
+                  <span>Selected: <span className="text-cyan-300 font-bold">Index {selectedCam} ({cameras.find(c => c.index === selectedCam)?.tag || cameras.find(c => c.index === selectedCam)?.name || 'Camera'})</span></span>
                   <span className="text-emerald-400 font-bold">● {cameras.length} camera(s) detected</span>
                 </div>
               </div>

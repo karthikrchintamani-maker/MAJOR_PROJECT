@@ -19,10 +19,12 @@ from config import (
     POTHOLE_CONF_THRESH, POTHOLE_NMS_THRESH,
     POTHOLE_TARGET_CLASSES, POTHOLE_DEBUG_LOGGING,
     DETECTION_CLASSES, POTHOLE_CLASSES,
+    ROAD_TARGET_CLASSES,
 )
 from models_loader import (
     ModelInfo, preprocess_frame,
     decode_yolo_detect_output,
+    decode_yolo_seg,
 )
 
 log = logging.getLogger("roadeye.pipeline")
@@ -81,6 +83,13 @@ class RoadEyePipeline:
             history=120, varThreshold=50, detectShadows=False)
         # Thread pool — reused across frames (no spawn overhead per frame)
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="roadeye-infer")
+        # Face cascade for webcam close-up testing (detects person sitting in front of webcam)
+        try:
+            self._face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+        except Exception:
+            self._face_cascade = None
         log.info("Pipeline ready. Backends: %s",
                  {k: v.backend for k, v in models.items()})
 
@@ -105,8 +114,6 @@ class RoadEyePipeline:
         out    = frame_bgr.copy()
 
         # ── Parallel inference: all 4 models run simultaneously ──────────────
-        # Before: sequential  ~2000ms  (model1 → model2 → model3 → model4)
-        # After:  parallel     ~500ms  (all models run at the same time)
         futures = {}
         det_m = self.models.get("detection")
         pot_m = self.models.get("pothole")
@@ -129,39 +136,98 @@ class RoadEyePipeline:
         # Collect parallel results (waits for all to finish)
         if "detection" in futures:
             try:
-                result.detections = futures["detection"].result(timeout=5.0)
+                result.detections = futures["detection"].result(timeout=12.0)
             except Exception as e:
                 log.error("Detection parallel error: %s", e)
-                result.detections = self._sim_detection(frame_bgr, (h, w))
-        elif show_boxes:
+                result.detections = []
+        elif show_boxes and (not det_m or det_m.backend == "simulation"):
             result.detections = self._sim_detection(frame_bgr, (h, w))
-
-        if "pothole" in futures:
-            try:
-                obstacles = [d.box for d in result.detections]
-                result.potholes = futures["pothole"].result(timeout=5.0)
-            except Exception as e:
-                log.error("Pothole parallel error: %s", e)
-                result.potholes = self._sim_pothole(frame_bgr, (h, w))
-        elif show_boxes:
-            result.potholes = self._sim_pothole(frame_bgr, (h, w))
 
         if "segmentation" in futures:
             try:
-                result.seg_mask = futures["segmentation"].result(timeout=5.0)
+                result.seg_mask = futures["segmentation"].result(timeout=12.0)
             except Exception as e:
                 log.error("Segmentation parallel error: %s", e)
-                result.seg_mask = self._sim_segmentation(frame_bgr, (h, w))
-        elif show_seg:
+                result.seg_mask = None
+        elif show_seg and (not seg_m or seg_m.backend == "simulation"):
             result.seg_mask = self._sim_segmentation(frame_bgr, (h, w))
+
+        if "pothole" in futures:
+            try:
+                result.potholes = futures["pothole"].result(timeout=12.0)
+            except Exception as e:
+                log.error("Pothole parallel error: %s", e)
+                result.potholes = []
+
+        # Pothole fallback:
+        # If running in simulation mode, OR on unpaved dirt/mud roads (where asphalt segmentation detects 0 road pixels):
+        # run road anomaly extraction.
+        # On a normal paved highway/city road (has_paved_road is True), 0 ONNX detections means the highway is clean (0 potholes)!
+        has_paved_road = (result.seg_mask is not None and np.count_nonzero(result.seg_mask == 1) > 4000)
+        if not result.potholes and show_boxes:
+            if not pot_m or pot_m.backend == "simulation":
+                result.potholes = self._sim_pothole(frame_bgr, (h, w))
+            elif not has_paved_road:
+                result.potholes = self._sim_pothole(frame_bgr, (h, w))
 
         if "depth" in futures:
             try:
-                result.depth_map = futures["depth"].result(timeout=5.0)
+                result.depth_map = futures["depth"].result(timeout=12.0)
             except Exception as e:
                 log.error("Depth parallel error: %s", e)
-        elif show_depth:
+        elif show_depth and (not dep_m or dep_m.backend == "simulation"):
             result.depth_map = self._sim_depth(frame_bgr, (h, w))
+
+        # ── Cross-Filter Potholes against Obstacles & Road Surface ──────────
+        # 1. Potholes can never overlap with vehicles, pedestrians, or animals
+        if result.potholes and result.detections:
+            clean_pots = []
+            for p in result.potholes:
+                px1, py1, px2, py2 = p.box
+                p_area = max(1, (px2 - px1) * (py2 - py1))
+                pcx = (px1 + px2) / 2.0
+                pcy = (py1 + py2) / 2.0
+                overlaps = False
+                for d in result.detections:
+                    ox1, oy1, ox2, oy2 = d.box
+                    ob_w = ox2 - ox1
+                    ob_h = oy2 - oy1
+                    ob_area = max(1, ob_w * ob_h)
+                    # Center inside obstacle
+                    if ox1 <= pcx <= ox2 and oy1 <= pcy <= oy2:
+                        overlaps = True
+                        break
+                    # Bounding box intersection
+                    ix1 = max(px1, ox1); iy1 = max(py1, oy1)
+                    ix2 = min(px2, ox2); iy2 = min(py2, oy2)
+                    if ix2 > ix1 and iy2 > iy1:
+                        inter = (ix2 - ix1) * (iy2 - iy1)
+                        if (inter / p_area > 0.15) or (inter / ob_area > 0.15):
+                            overlaps = True
+                            break
+                    # Trailing vehicle shadow immediately below bottom bumper
+                    h_inter = max(0, min(px2, ox2) - max(px1, ox1))
+                    if h_inter / max(px2 - px1, 1) > 0.40:
+                        if oy1 <= py1 <= oy2 + ob_h * 0.25:
+                            overlaps = True
+                            break
+                if not overlaps:
+                    clean_pots.append(p)
+            result.potholes = clean_pots
+
+        # 2. Road surface validation: On paved roads, potholes must be on the drivable road surface
+        # Eliminates false positives on roadside trees, buildings, signs, and background
+        if result.potholes and has_paved_road:
+            road_pots = []
+            for p in result.potholes:
+                px1, py1, px2, py2 = p.box
+                pcx = int((px1 + px2) / 2.0)
+                roi = result.seg_mask[py1:py2, px1:px2]
+                road_fill = (roi == 1).mean() if roi.size > 0 else 0
+                base_on_road = (result.seg_mask[min(h - 1, py2), pcx] == 1) or (result.seg_mask[int((py1 + py2) / 2), pcx] == 1)
+                if road_fill >= 0.35 and base_on_road:
+                    road_pots.append(p)
+            result.potholes = road_pots
 
         # Analytics
         result.risk_score     = self._risk(result, (h, w))
@@ -185,12 +251,35 @@ class RoadEyePipeline:
         try:
             tensor, lb_meta = preprocess_frame(frame, INPUT_SIZE, normalize=True, use_letterbox=True)
             outs   = model.session.run(model.output_names, {model.input_name: tensor})
-            raw    = decode_yolo_detect_output(outs[0], orig_hw, conf_thresh=CONF_THRESH, iou_thresh=NMS_THRESH, letterbox_meta=lb_meta)
-            return [Detection(d["box"], d["conf"], d["cls"],
-                              DETECTION_CLASSES.get(d["cls"], f"cls{d['cls']}")) for d in raw]
+            raw    = decode_yolo_detect_output(
+                outs[0], orig_hw,
+                conf_thresh=CONF_THRESH,
+                iou_thresh=NMS_THRESH,
+                letterbox_meta=lb_meta,
+                target_classes=ROAD_TARGET_CLASSES
+            )
+            dets = []
+            for d in raw:
+                lbl = DETECTION_CLASSES.get(d["cls"], f"cls{d['cls']}")
+                if lbl.lower() == "person":
+                    lbl = "Person"
+                dets.append(Detection(d["box"], d["conf"], d["cls"], lbl))
+
+            # If no person was detected and face cascade is available (e.g. webcam close-up testing):
+            if not any(d.label == "Person" for d in dets) and getattr(self, "_face_cascade", None) is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self._face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(50, 50))
+                for (fx, fy, fw, fh) in faces:
+                    px1 = max(0, fx - int(fw * 0.25))
+                    py1 = max(0, fy - int(fh * 0.15))
+                    px2 = min(orig_hw[1] - 1, fx + fw + int(fw * 0.25))
+                    py2 = min(orig_hw[0] - 1, fy + int(fh * 2.5))
+                    dets.append(Detection(box=[px1, py1, px2, py2], conf=0.88, cls=29, label="Person"))
+
+            return dets
         except Exception as e:
             log.error("Detection error: %s", e)
-            return self._sim_detection(frame, orig_hw)
+            return []
 
     def _run_pothole(self, frame, model, orig_hw, obstacles=None):
         """
@@ -322,17 +411,13 @@ class RoadEyePipeline:
 
     def _run_segmentation(self, frame, model, orig_hw):
         try:
-            tensor = preprocess_frame(frame, INPUT_SIZE)
-            outs   = model.session.run(model.output_names, {model.input_name: tensor})
-            proto  = outs[1][0]   # (32,160,160)
-            rough  = proto.mean(axis=0)
-            rough  = (rough - rough.min()) / (rough.max() - rough.min() + 1e-6)
-            mask160 = (rough > 0.5).astype(np.uint8)
-            h, w = orig_hw
-            return cv2.resize(mask160, (w, h), interpolation=cv2.INTER_NEAREST)
+            tensor, lb_meta = preprocess_frame(frame, INPUT_SIZE, normalize=True, use_letterbox=True)
+            outs = model.session.run(model.output_names, {model.input_name: tensor})
+            mask = decode_yolo_seg(outs, orig_hw, conf_thresh=0.45, letterbox_meta=lb_meta)
+            return mask
         except Exception as e:
             log.error("Segmentation error: %s", e)
-            return self._sim_segmentation(frame, orig_hw)
+            return None
 
     def _run_depth(self, frame, model, orig_hw):
         try:
@@ -533,7 +618,7 @@ class RoadEyePipeline:
 
         # 2. Road search vertical span: from horizon down to bonnet/foreground
         search_mask = np.zeros((h, w), dtype=np.uint8)
-        search_mask[int(h * 0.22):int(h * 0.98), :] = 255
+        search_mask[int(h * 0.36):int(h * 0.98), :] = 255
         search_mask[green_grass] = 0
 
         # 3. Multi-scale anomaly extraction:
@@ -629,6 +714,10 @@ class RoadEyePipeline:
                 label="Pothole"
             ))
 
+        # Select the top most prominent potholes (by prominence = area * confidence) to prevent screen clutter
+        if len(results) > 6:
+            results = sorted(results, key=lambda d: ((d.box[2] - d.box[0]) * (d.box[3] - d.box[1]) * d.conf), reverse=True)[:6]
+
         # Sort top-to-bottom, left-to-right (scanning order)
         results.sort(key=lambda d: (d.box[1], d.box[0]))
         return results
@@ -713,17 +802,17 @@ class RoadEyePipeline:
     def _draw(self, img, r, show_boxes, show_seg, show_depth, show_lanes):
         h, w = img.shape[:2]
 
-        # Road segmentation overlay
-        if show_seg and r.seg_mask is not None:
+        # Road segmentation overlay: only apply if road pixels were actually detected
+        if show_seg and r.seg_mask is not None and np.any(r.seg_mask == 1):
             overlay = img.copy()
             overlay[r.seg_mask == 1] = (0, 160, 70)   # dark green
-            cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
+            cv2.addWeighted(overlay, 0.18, img, 0.82, 0, img)
 
-        # Lane boundary lines (perspective trapezoid, anti-aliased)
+        # Lane boundary lines (straight vehicle path lines with wide lane width matching driving perspective)
         if show_lanes:
             for pts in [
-                [(int(w * 0.10), h), (int(w * 0.34), int(h * 0.52))],
-                [(int(w * 0.90), h), (int(w * 0.66), int(h * 0.52))],
+                [(int(w * 0.16), h), (int(w * 0.38), int(h * 0.60))],
+                [(int(w * 0.84), h), (int(w * 0.62), int(h * 0.60))],
             ]:
                 cv2.line(img, pts[0], pts[1], (0, 229, 255), 3, cv2.LINE_AA)
 

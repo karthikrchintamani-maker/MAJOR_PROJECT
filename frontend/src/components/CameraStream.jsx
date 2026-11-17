@@ -8,6 +8,7 @@ export default function CameraStream({ toggles, activeScenario, backendOnline, s
   const imgRef = useRef(null);
   const canvasRef = useRef(null);
   const [imgError, setImgError] = useState(false);
+  const [streamSrc, setStreamSrc] = useState(`${STREAM_URL}?t=${Date.now()}`);
   const [images, setImages] = useState({
     base: null,
     depth: null,
@@ -15,6 +16,33 @@ export default function CameraStream({ toggles, activeScenario, backendOnline, s
     pothole: null,
     segment: null
   });
+
+  // Whenever backend becomes active or online, reset error and refresh stream URL
+  useEffect(() => {
+    if (backendOnline && streamActive) {
+      setImgError(false);
+      setStreamSrc(`${STREAM_URL}?t=${Date.now()}`);
+    }
+  }, [backendOnline, streamActive]);
+
+  // Release browser socket connection immediately on component unmount
+  useEffect(() => {
+    return () => {
+      if (imgRef.current) {
+        imgRef.current.src = '';
+      }
+    };
+  }, []);
+
+  const handleImgError = () => {
+    setImgError(true);
+    setTimeout(() => {
+      if (backendOnline && streamActive) {
+        setImgError(false);
+        setStreamSrc(`${STREAM_URL}?t=${Date.now()}`);
+      }
+    }, 1200);
+  };
 
   // Preload local model images for high-fidelity fallback simulation
   useEffect(() => {
@@ -176,10 +204,11 @@ export default function CameraStream({ toggles, activeScenario, backendOnline, s
         {backendOnline && streamActive && (
           <img
             ref={imgRef}
-            src={`${STREAM_URL}?t=${Date.now()}`}
+            src={streamSrc}
             alt="RoadEye Live Stream"
+            crossOrigin="anonymous"
             className={`w-full h-full object-fill ${imgError ? 'hidden' : 'block'}`}
-            onError={() => setImgError(true)}
+            onError={handleImgError}
             onLoad={() => setImgError(false)}
             style={{ display: imgError ? 'none' : 'block' }}
           />
