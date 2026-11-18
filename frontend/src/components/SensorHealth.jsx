@@ -2,16 +2,17 @@ import React from 'react';
 import { Cpu } from 'lucide-react';
 
 export default function SensorHealth({ health }) {
-  // Construct the exact matrix list as shown in the reference image
+  // Sensor & system health matrix updating live with mobile IoT node and perception status
+  const isMobileOnline = health.mobileIotConnected;
   const sensors = [
-    { name: 'NEO-6M GPS Module', status: health.gps, val: '100%' },
-    { name: 'NEO-M8N GPS Module', status: health.gps, val: '100%' },
-    { name: 'Speed Sensor (GPS)', status: health.gps, val: '100%' },
-    { name: 'IMU (MPU-6050)', status: health.imu, val: '100%' },
-    { name: 'ESP32 CAM (640x480)', status: health.camera, val: '100%' },
-    { name: 'TFMini / LiDAR', status: health.lidar, val: '100%' },
-    { name: 'LM2597 DC-DC Interface', status: health.obd, val: '100%' },
-    { name: 'SIM800L (SOS Emergency)', status: health.gsm, val: '100%' },
+    { name: 'Mobile IoT Node (Kotlin / UDP 5005)', status: isMobileOnline, val: isMobileOnline ? `${health.mobileHz || 20} Hz` : 'WAITING' },
+    { name: 'Mobile GNSS / GPS Sensor', status: health.gps, val: isMobileOnline ? 'FIX' : '100%' },
+    { name: 'Tri-Axial MEMS Accelerometer', status: health.imu, val: '100%' },
+    { name: 'Tri-Axial MEMS Gyroscope', status: health.imu, val: '100%' },
+    { name: 'Vision Pilot Camera (DirectShow)', status: health.camera, val: health.camera ? 'STREAMING' : 'IDLE' },
+    { name: 'LiDAR / Proximity Sensor', status: health.lidar, val: '100%' },
+    { name: 'OBD-II CAN-Bus (ISO 15765-4)', status: health.obd, val: health.obd ? 'CAN ONLINE' : 'READY' },
+    { name: 'SIM800L (SOS Crash Gateway)', status: health.gsm, val: 'STANDBY' },
     { name: 'System Load', status: true, val: `${health.systemLoad}%`, isMetric: true },
     { name: 'System Temp', status: true, val: `${health.temp}°C`, isMetric: true },
     { name: 'Perception FPS (ONNX)', status: true, val: `${health.fps}`, isMetric: true },

@@ -25,7 +25,9 @@ import io
 import json
 import time
 import datetime
-from collections import Counter
+import socket
+import zlib
+from collections import Counter, deque
 import logging
 import threading
 import traceback
@@ -137,6 +139,131 @@ _overlay_toggles = {
 # WebSocket client list
 _ws_clients: set = set()
 _ws_lock = threading.Lock()
+
+# ─── Mobile IoT UDP Receiver (Kotlin App on Port 5005) ────────────────────────
+_mobile_iot_lock = threading.Lock()
+_latest_mobile_iot: dict | None = None
+_mobile_iot_stats = {
+    "total_packets": 0,
+    "dropped_packets": 0,
+    "last_seq": None,
+    "rate_hz": 0.0,
+    "last_received": 0.0,
+    "crc_errors": 0,
+    "sender_addr": None,
+    "device_id": None,
+    "_last_logged_connect": 0.0,
+}
+_mobile_packet_times = deque(maxlen=100)
+_udp_socket: socket.socket | None = None
+_udp_running = threading.Event()
+_udp_thread: threading.Thread | None = None
+_beacon_thread: threading.Thread | None = None
+
+def _udp_telemetry_loop():
+    """Continuously listens for JSON UDP datagrams from the Kotlin mobile app on port 5005."""
+    global _udp_socket, _latest_mobile_iot
+    log.info("Starting Mobile IoT UDP receiver on 0.0.0.0:5005 (RoadEye Nexus)...")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", 5005))
+        sock.settimeout(1.0)
+        _udp_socket = sock
+    except Exception as e:
+        log.error(f"Failed to bind UDP port 5005: {e}")
+        return
+
+    while _udp_running.is_set():
+        try:
+            data, addr = sock.recvfrom(16384)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            if not _udp_running.is_set():
+                break
+            log.warning(f"UDP recv error: {e}")
+            time.sleep(0.1)
+            continue
+
+        now = time.time()
+        _mobile_packet_times.append(now)
+        while _mobile_packet_times and now - _mobile_packet_times[0] > 2.0:
+            _mobile_packet_times.popleft()
+        rate_hz = len(_mobile_packet_times) / 2.0 if _mobile_packet_times else 0.0
+
+        try:
+            pkt = json.loads(data.decode("utf-8"))
+        except Exception:
+            continue
+
+        # CRC32 verification (zlib.crc32 over compact JSON without "crc32" key)
+        received_crc = pkt.pop("crc32", None)
+        crc_match = False
+        if received_crc:
+            try:
+                compact_bytes = json.dumps(pkt, separators=(',', ':')).encode('utf-8')
+                calc_crc = f"{zlib.crc32(compact_bytes) & 0xFFFFFFFF:08X}"
+                crc_match = (received_crc == calc_crc)
+            except Exception:
+                pass
+        pkt["crc32"] = received_crc
+        pkt["crc_match"] = crc_match
+
+        seq = pkt.get("seq")
+        with _mobile_iot_lock:
+            _latest_mobile_iot = pkt
+            stats = _mobile_iot_stats
+            stats["total_packets"] += 1
+            stats["last_received"] = now
+            stats["rate_hz"] = round(rate_hz, 1)
+            stats["sender_addr"] = f"{addr[0]}:{addr[1]}"
+            stats["device_id"] = pkt.get("device_id", "Mobile_Node")
+            if not crc_match and received_crc:
+                stats["crc_errors"] += 1
+            if isinstance(seq, int):
+                last_s = stats["last_seq"]
+                if last_s is not None and seq > last_s + 1:
+                    stats["dropped_packets"] += (seq - last_s - 1)
+                stats["last_seq"] = seq
+
+        if stats["total_packets"] == 1 or (now - stats.get("_last_logged_connect", 0.0)) > 60.0:
+            dev = pkt.get("device_id", "Mobile_Node")
+            _append_operation_log(f"[IoT Mobile] Live telemetry node active: {dev} ({addr[0]}:{addr[1]})")
+            stats["_last_logged_connect"] = now
+
+        if pkt.get("road_intelligence", {}).get("impact_detected"):
+            vib = pkt.get("road_intelligence", {}).get("vibration_rms", 0.0)
+            _append_operation_log(f"[Road Anomaly] ⚠️ High-Impact Shock detected by Mobile Sensor: {vib:.3f} m/s²")
+
+    try:
+        sock.close()
+    except Exception:
+        pass
+    log.info("Mobile IoT UDP receiver exited.")
+
+def _start_udp_receiver():
+    global _udp_thread
+    if _udp_thread is None or not _udp_thread.is_alive():
+        _udp_running.set()
+        _udp_thread = threading.Thread(target=_udp_telemetry_loop, daemon=True, name="mobile-udp-receiver")
+        _udp_thread.start()
+
+def _telemetry_beacon_loop():
+    """Broadcasts WebSocket telemetry at 10 Hz when the video pipeline is idle."""
+    while True:
+        try:
+            if not _running.is_set():
+                _broadcast_telemetry(None)
+            time.sleep(0.1)
+        except Exception:
+            time.sleep(0.5)
+
+def _start_telemetry_beacon():
+    global _beacon_thread
+    if _beacon_thread is None or not _beacon_thread.is_alive():
+        _beacon_thread = threading.Thread(target=_telemetry_beacon_loop, daemon=True, name="ws-telemetry-beacon")
+        _beacon_thread.start()
 
 # ─── Model Loading (done at startup) ─────────────────────────────────────────
 def _init_models():
@@ -292,7 +419,11 @@ def _capture_loop():
 
 
 # ─── WebSocket Broadcast ──────────────────────────────────────────────────────
-def _broadcast_telemetry(result: InferenceResult):
+def _broadcast_telemetry(result: InferenceResult | None = None):
+    if result is None:
+        with _frame_lock:
+            result = _latest_result or InferenceResult()
+
     now = time.time()
     last_state = getattr(_broadcast_telemetry, "_last_state", {
         "time": 0.0, "summary": "", "warn_time": 0.0, "pothole_time": 0.0, "hb_time": 0.0
@@ -334,19 +465,31 @@ def _broadcast_telemetry(result: InferenceResult):
 
     _broadcast_telemetry._last_state = last_state
 
+    # Fetch latest Mobile IoT telemetry
+    with _mobile_iot_lock:
+        mobile_data = _latest_mobile_iot
+        mobile_stats = dict(_mobile_iot_stats)
+
+    is_mobile_active = (now - mobile_stats.get("last_received", 0.0)) < 3.5
+
     payload = json.dumps({
-        "riskScore":       result.risk_score,
-        "closestDistM":    result.closest_dist_m,
-        "detections":      len(result.detections),
-        "potholes":        len(result.potholes),
-        "detection_items": det_items,
-        "pothole_items":   pothole_items,
-        "fps":             result.fps,
-        "mode":            result.mode,
-        "warnings":        result.warnings,
-        "source":          _source_type,
-        "ts":              now,
-        "logs":            new_logs,
+        "riskScore":          result.risk_score,
+        "closestDistM":       result.closest_dist_m,
+        "detections":         len(result.detections),
+        "potholes":           len(result.potholes),
+        "detection_items":    det_items,
+        "pothole_items":      pothole_items,
+        "fps":                result.fps,
+        "mode":               result.mode,
+        "warnings":           result.warnings,
+        "source":             _source_type,
+        "ts":                 now,
+        "logs":               new_logs,
+        # Mobile Kotlin IoT telemetry
+        "mobileIot":          mobile_data,
+        "mobileIotActive":    is_mobile_active,
+        "mobileIotHz":        mobile_stats.get("rate_hz", 0.0),
+        "mobileIotStats":     mobile_stats,
     })
     dead = set()
     with _ws_lock:
@@ -482,15 +625,123 @@ def api_status():
                   for k, v in _models.items()}
     with _frame_lock:
         res = _latest_result
+    with _mobile_iot_lock:
+        m_stats = dict(_mobile_iot_stats)
+    now = time.time()
     return jsonify({
-        "status":      "online",
-        "running":     _running.is_set(),
-        "source":      _source_type,
-        "webcam_index": cfg.WEBCAM_INDEX,
-        "models":      model_info,
-        "fps":         res.fps if res else 0,
-        "riskScore":   res.risk_score if res else 0,
+        "status":             "online",
+        "running":            _running.is_set(),
+        "source":             _source_type,
+        "webcam_index":       cfg.WEBCAM_INDEX,
+        "models":             model_info,
+        "fps":                res.fps if res else 0,
+        "riskScore":          res.risk_score if res else 0,
+        "mobile_iot_active":  (now - m_stats.get("last_received", 0.0)) < 3.5,
+        "mobile_iot_device":  m_stats.get("device_id"),
+        "mobile_iot_hz":      m_stats.get("rate_hz", 0),
+        "mobile_iot_packets": m_stats.get("total_packets", 0),
     })
+
+
+@app.route("/api/iot/telemetry", methods=["GET"])
+def api_get_iot_telemetry():
+    """Returns the latest mobile IoT telemetry packet received on UDP port 5005."""
+    with _mobile_iot_lock:
+        pkt = _latest_mobile_iot
+        stats = dict(_mobile_iot_stats)
+    now = time.time()
+    active = (now - stats.get("last_received", 0.0)) < 3.5
+    return jsonify({
+        "active": active,
+        "stats": stats,
+        "data": pkt
+    })
+
+
+@app.route("/api/iot/simulate", methods=["POST"])
+def api_simulate_iot():
+    """Allows injecting or testing an incoming Kotlin UDP datagram."""
+    data = request.get_json(silent=True) or {}
+    now = time.time()
+    sample_pkt = {
+        "device_id": data.get("device_id", "RoadEye_Nexus_Node01"),
+        "seq": int(data.get("seq", int(now * 10) % 100000)),
+        "timestamp": now,
+        "stream_hz": 20,
+        "thermal_status": "NOMINAL",
+        "sensors": {
+            "accel": data.get("accel", {"x": 0.12, "y": 9.81, "z": -0.45}),
+            "gyro": data.get("gyro", {"x": 0.01, "y": -0.02, "z": 0.05}),
+            "mag": {"x": 25.1, "y": -12.3, "z": 45.0},
+            "gravity": {"x": 0.05, "y": 9.80, "z": 0.11},
+            "linear_accel": {"x": 0.22, "y": -0.14, "z": 0.85},
+            "rotation_vector": {"x": 0.012, "y": -0.008, "z": 0.707, "w": 0.707},
+            "orientation": data.get("orientation", {"pitch_deg": 1.5, "roll_deg": -0.8, "yaw_deg": 182.4}),
+            "barometer": {"pressure_hpa": 910.25, "rel_altitude_m": 895.4},
+            "ambient_light": {"lux": 1240.5, "condition": "DAYLIGHT"},
+            "proximity": {"distance_cm": 5.0, "is_near": False},
+            "audio": {"active": True, "rms_dbfs": -34.2, "peak_amp": 0.125, "zcr_hz": 420.5},
+            "gps": data.get("gps", {
+                "lat": 13.134,
+                "lng": 77.962,
+                "altitude_m": 920.0,
+                "speed_mps": 14.5,
+                "bearing": 182.4,
+                "accuracy_m": 4.2,
+                "has_fix": True
+            }),
+            "availability": {
+                "accel": True, "gyro": True, "mag": True, "gravity": True,
+                "linear_accel": True, "rotation_vector": True, "barometer": True,
+                "light": True, "proximity": True, "audio": True
+            }
+        },
+        "device_health": {
+            "battery_pct": 82,
+            "battery_temp_c": 33.4,
+            "charging": True,
+            "wifi_rssi_dbm": -54,
+            "wifi_link_mbps": 433
+        },
+        "road_intelligence": data.get("road_intelligence", {
+            "condition_score": 88,
+            "surface_class": "SMOOTH",
+            "vibration_rms": 0.885,
+            "impact_detected": False
+        }),
+        "obd2": data.get("obd2", {
+            "connected": True,
+            "protocol": "ISO 15765-4 (CAN 11/500)",
+            "speed_kmh": 52,
+            "rpm": 2400,
+            "throttle_pos": 18.5,
+            "coolant_temp_c": 88,
+            "engine_load": 34.2,
+            "intake_temp_c": 29,
+            "maf_gps": 14.25,
+            "timing_advance_deg": 12.5,
+            "fuel_level_pct": 68.0,
+            "dtc_count": 0,
+            "dtcs": []
+        }),
+    }
+
+    # Calculate CRC32
+    compact_bytes = json.dumps(sample_pkt, separators=(',', ':')).encode('utf-8')
+    calc_crc = f"{zlib.crc32(compact_bytes) & 0xFFFFFFFF:08X}"
+    sample_pkt["crc32"] = calc_crc
+    sample_pkt["crc_match"] = True
+
+    with _mobile_iot_lock:
+        global _latest_mobile_iot
+        _latest_mobile_iot = sample_pkt
+        _mobile_iot_stats["total_packets"] += 1
+        _mobile_iot_stats["last_received"] = now
+        _mobile_iot_stats["rate_hz"] = 20.0
+        _mobile_iot_stats["sender_addr"] = "127.0.0.1:local_sim"
+        _mobile_iot_stats["device_id"] = sample_pkt["device_id"]
+
+    return jsonify({"status": "simulated", "crc32": calc_crc, "data": sample_pkt})
 
 
 @app.route("/api/video/start", methods=["POST"])
@@ -692,17 +943,24 @@ def ws_telemetry(ws):
             res = _latest_result
         with _logs_lock:
             init_logs = list(_recent_logs[-35:])
+        with _mobile_iot_lock:
+            mobile_data = _latest_mobile_iot
+            mobile_stats = dict(_mobile_iot_stats)
         ws.send(json.dumps({
-            "riskScore":    res.risk_score if res else 0,
-            "closestDistM": res.closest_dist_m if res else 0,
-            "detections":   len(res.detections) if res else 0,
-            "potholes":     len(res.potholes) if res else 0,
-            "fps":          res.fps if res else 0,
-            "mode":         res.mode if res else "ACTIVE",
-            "warnings":     res.warnings if res else [],
-            "source":       _source_type,
-            "ts":           time.time(),
-            "logs":         init_logs,
+            "riskScore":       res.risk_score if res else 0,
+            "closestDistM":    res.closest_dist_m if res else 0,
+            "detections":      len(res.detections) if res else 0,
+            "potholes":        len(res.potholes) if res else 0,
+            "fps":             res.fps if res else 0,
+            "mode":            res.mode if res else "ACTIVE",
+            "warnings":        res.warnings if res else [],
+            "source":          _source_type,
+            "ts":              time.time(),
+            "logs":            init_logs,
+            "mobileIot":       mobile_data,
+            "mobileIotActive": (time.time() - mobile_stats.get("last_received", 0.0)) < 3.5,
+            "mobileIotHz":     mobile_stats.get("rate_hz", 0.0),
+            "mobileIotStats":  mobile_stats,
         }))
         # Keep connection alive — data is pushed from _broadcast_telemetry
         while True:
@@ -756,6 +1014,11 @@ if __name__ == "__main__":
     log.info("Server listening on http://%s:%d", host, port)
     log.info("MJPEG stream: http://localhost:%d/stream/video", port)
     log.info("WebSocket:    ws://localhost:%d/ws/telemetry", port)
+    log.info("UDP Port:     0.0.0.0:5005 (Kotlin Mobile Telemetry Receiver)")
+
+    # Start background threads for Mobile IoT UDP listener and WebSocket telemetry beacon
+    _start_udp_receiver()
+    _start_telemetry_beacon()
 
     # Use threaded=True so WebSocket + MJPEG can coexist
     app.run(host=host, port=port, threaded=True, use_reloader=False)

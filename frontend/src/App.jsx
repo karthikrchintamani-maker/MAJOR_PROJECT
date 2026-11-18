@@ -8,6 +8,7 @@ import CameraStream from './components/CameraStream';
 import GpsMap from './components/GpsMap';
 import SensorHealth from './components/SensorHealth';
 import VideoSourcePanel from './components/VideoSourcePanel';
+import MobileSensorHub from './components/MobileSensorHub';
 import {
   Terminal,
   Settings,
@@ -74,6 +75,11 @@ export default function App() {
   });
 
   const [activeWarning, setActiveWarning] = useState(null);
+
+  // ── Mobile IoT Live Telemetry (Kotlin App via UDP 5005) ─────────────────
+  const [mobileIot, setMobileIot] = useState(null);
+  const [mobileIotActive, setMobileIotActive] = useState(false);
+  const [mobileIotHz, setMobileIotHz] = useState(0);
 
   const [sensorHealth, setSensorHealth] = useState({
     camera: true, lidar: true, gps: true, imu: true,
@@ -205,10 +211,37 @@ export default function App() {
             setActiveWarning(null);
           }
 
+          // Mobile IoT telemetry ingestion from Kotlin UDP node
+          if (data.mobileIot) {
+            setMobileIot(data.mobileIot);
+            setMobileIotActive(Boolean(data.mobileIotActive));
+            setMobileIotHz(data.mobileIotHz || 0);
+
+            const obd = data.mobileIot.obd2;
+            const gps = data.mobileIot.sensors?.gps;
+            setTelemetry(prev => ({
+              ...prev,
+              speedKmh: (obd?.connected && typeof obd.speed_kmh === 'number')
+                ? obd.speed_kmh
+                : (gps?.has_fix && typeof gps.speed_mps === 'number' ? Math.round(gps.speed_mps * 3.6) : prev.speedKmh),
+              rpm: (obd?.connected && typeof obd.rpm === 'number') ? obd.rpm : prev.rpm,
+              lat: (gps?.has_fix && typeof gps.lat === 'number') ? gps.lat : prev.lat,
+              lng: (gps?.has_fix && typeof gps.lng === 'number') ? gps.lng : prev.lng,
+              coolantTemp: (obd?.connected && typeof obd.coolant_temp_c === 'number') ? obd.coolant_temp_c : prev.coolantTemp,
+            }));
+          } else {
+            setMobileIotActive(false);
+          }
+
           setSensorHealth(prev => ({
             ...prev,
             fps:        data.fps || prev.fps,
             camera:     data.source !== 'none',
+            mobileIotConnected: Boolean(data.mobileIotActive),
+            mobileHz:   data.mobileIotHz || 0,
+            gps:        data.mobileIot?.sensors?.gps?.has_fix ?? prev.gps,
+            imu:        data.mobileIot?.sensors?.availability?.accel ?? prev.imu,
+            obd:        data.mobileIot?.obd2?.connected ?? prev.obd,
           }));
         } catch (e) { /* ignore parse errors */ }
       };
@@ -678,9 +711,12 @@ export default function App() {
 
         {/* ── TAB: Sensor Hub / System Health ───────────────────────────── */}
         {['Sensor Hub', 'System Health'].includes(activeTab) && (
-          <div className="flex-1 min-h-0 grid grid-cols-12 gap-3">
-            <div className="col-span-4 h-full"><SensorHealth health={sensorHealth} /></div>
-            <div className="col-span-8 h-full"><GpsMap lat={telemetry.lat} lng={telemetry.lng} activeScenario={activeScenario} onUpdateLocation={handleUpdateLocation} /></div>
+          <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-3 pr-1">
+            <MobileSensorHub mobileIot={mobileIot} mobileActive={mobileIotActive} mobileHz={mobileIotHz} />
+            <div className="grid grid-cols-12 gap-3 min-h-[280px] flex-1">
+              <div className="col-span-5 h-full min-h-[280px]"><SensorHealth health={sensorHealth} /></div>
+              <div className="col-span-7 h-full min-h-[280px]"><GpsMap lat={telemetry.lat} lng={telemetry.lng} activeScenario={activeScenario} onUpdateLocation={handleUpdateLocation} /></div>
+            </div>
           </div>
         )}
 
